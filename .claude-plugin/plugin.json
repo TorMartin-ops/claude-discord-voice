@@ -1,0 +1,7 @@
+{
+  "name": "discord-voice",
+  "description": "Discord voice channel for Claude Code — speak to Claude via Discord voice chat with STT/TTS.",
+  "version": "0.1.0",
+  "channel": true,
+  "keywords": ["discord", "voice", "speech", "tts", "stt", "channel"]
+}
