@@ -1,5 +1,7 @@
 # claude-discord-voice
 
+> **Status: Early alpha** — This plugin works but has known issues. Contributions welcome!
+
 Discord voice channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Speak to Claude via Discord voice chat — speech is transcribed via Azure Speech-to-Text and responses are spoken back via Edge TTS.
 
 ## Features
@@ -10,12 +12,31 @@ Discord voice channel plugin for [Claude Code](https://docs.anthropic.com/en/doc
 - **Cost controls** — Per-user rate limits, global concurrent STT cap, configurable daily budget ($1/day default)
 - **Auto-disconnect** — Leaves the channel after 10 minutes of silence
 
+## Known Issues
+
+These are the main problems that need fixing. If you want to contribute, these are great places to start:
+
+### TTS abort crash
+The `TextToSpeech.abort()` method throws an unhandled `Error: Aborted` when barge-in interrupts playback mid-stream. The error propagates from the audio transform pipeline and crashes the process. Needs proper error handling around the interrupt flow in `voice-pipeline.ts`.
+
+### Notification delivery is unreliable
+MCP notifications (`notifications/claude/channel`) are sometimes silently dropped by Claude Code. The plugin has a `poll_queue` fallback that writes transcriptions to disk, but Claude Code doesn't always poll it. This means spoken messages can get lost.
+
+### Azure F0 free tier limitations
+The free Azure Speech tier only allows 1 concurrent STT request and 5 hours/month. The plugin works around this with a concurrent request cap, but heavy use will hit the monthly limit fast. Needs better error messaging when the budget is exhausted.
+
+### Anti-echo can still cause dead zones
+After TTS playback, there's a 500ms cooldown where user speech is ignored to prevent the bot from transcribing its own output. This sometimes causes the first word of a user's response to be clipped. A smarter approach (e.g., audio fingerprinting or stream-level echo cancellation) would improve conversation flow.
+
+### STT timeout can lose speech
+A 10-second hard timeout wraps `stt.transcribe()` to prevent hung Azure calls from blocking forever. But if Azure is just slow (not hung), this silently drops valid transcriptions. Needs a retry or partial-result mechanism.
+
 ## Prerequisites
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
 - Node.js 20+
 - A Discord bot with voice permissions ([setup guide](https://discord.com/developers/docs/getting-started))
-- An Azure Speech resource ([create one](https://portal.azure.com/#create/Microsoft.CognitiveServicesSpeechServices))
+- An Azure Speech resource ([create one](https://portal.azure.com/#create/Microsoft.CognitiveServicesSpeechServices)) — the free F0 tier works but has limitations (see above)
 
 ## Installation
 
@@ -25,13 +46,21 @@ Discord voice channel plugin for [Claude Code](https://docs.anthropic.com/en/doc
 git clone https://github.com/TorMartin-ops/claude-discord-voice.git ~/.claude/plugins/local/discord-voice
 ```
 
-2. Enable the plugin:
+2. Install dependencies and build:
+
+```bash
+cd ~/.claude/plugins/local/discord-voice
+npm install
+npm run build
+```
+
+3. Enable the plugin:
 
 ```bash
 claude plugins enable discord-voice@local
 ```
 
-3. Configure credentials:
+4. Configure credentials:
 
 ```bash
 # In a Claude Code session:
@@ -73,11 +102,41 @@ Once configured, use these tools in Claude Code:
 ## Architecture
 
 ```
-Discord audio (Opus 48kHz) → SafeOpusDecoder → Downsampler (16kHz mono)
-→ Silero VAD → Azure STT → MCP notification → Claude Code
-                                                    ↓
-Discord playback ← WebM Opus ← Edge TTS ← Claude response
+Discord audio (Opus 48kHz) -> SafeOpusDecoder -> Downsampler (16kHz mono)
+-> Silero VAD -> Azure STT -> MCP notification -> Claude Code
+                                                      |
+Discord playback <- WebM Opus <- Edge TTS <- Claude response
 ```
+
+### Source files
+
+| File | Purpose |
+|------|---------|
+| `src/server.ts` | MCP server — tool definitions, credential loading, Discord client setup |
+| `src/voice-pipeline.ts` | Orchestrator — wires audio receive, STT, TTS, and playback into a per-channel pipeline |
+| `src/stt.ts` | Azure Speech-to-Text wrapper with cost tracking, budget caps, and retry logic |
+| `src/tts.ts` | Edge TTS WebSocket client with DRM auth, SSML generation, and streaming |
+| `src/audio-utils.ts` | Opus decoding, downsampling (48kHz -> 16kHz), VAD (Silero v5), noise floor calibration |
+
+## Contributing
+
+This plugin is in early alpha and needs help! Here's how to get started:
+
+1. Fork the repo and clone it
+2. `npm install` to get dependencies
+3. `npm run build` to compile TypeScript
+4. Make your changes in `src/`
+5. Test by enabling the plugin in Claude Code and joining a voice channel
+6. Open a PR with a description of what you fixed
+
+### Priority areas for contribution
+
+- **Fix the TTS abort crash** — proper error handling in `voice-pipeline.ts` when barge-in interrupts playback
+- **Improve notification reliability** — investigate why MCP notifications get dropped and find a better delivery mechanism
+- **Better echo cancellation** — replace the cooldown timer with something smarter
+- **Multi-user support** — test and fix issues with multiple people in the same voice channel
+- **Error messages** — better user-facing errors when Azure credentials are wrong, budget is exhausted, etc.
+- **Tests** — there are currently no tests; adding even basic unit tests for STT/TTS would be valuable
 
 ## License
 
