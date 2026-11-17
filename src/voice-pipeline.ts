@@ -23,7 +23,9 @@ import {
 import { Client, type VoiceChannel, type StageChannel, type GuildMember } from "discord.js";
 import { Readable } from "stream";
 import { createOpusDecoder, createDownsampler, SpeechBuffer, type SpeechEvent } from "./audio-utils.js";
-import { debugLog } from "./debug.js";
+import { debugLog, debugText } from "./debug.js";
+import { isAllowedSpeaker, loadAllowlist, allowlistHelp } from "./access.js";
+import { safeError } from "./redact.js";
 import { ElevenLabsError } from "./elevenlabs.js";
 import { describeInterruption, Playback } from "./playback.js";
 import { SpeechToText, type SttSession, type STTUsage } from "./stt.js";
@@ -122,6 +124,11 @@ export class VoicePipeline {
     this.transcriptionCb = cb;
   }
 
+  /** True while a reply is being spoken or queued. */
+  get busy(): boolean {
+    return this.playback.busy;
+  }
+
   get isDestroyed(): boolean {
     return this.destroyed;
   }
@@ -175,9 +182,18 @@ export class VoicePipeline {
     this.tts.warmUp();
 
     this.connection.receiver.speaking.on("start", (userId: string) => {
-      if (this.destroyed || this.muted || this.listeners.has(userId)) return;
+      if (this.destroyed || this.muted) return;
+      if (!isAllowedSpeaker(userId)) {
+        // Not on the allowlist: never subscribe, decode or transcribe. Also drop
+        // a listener left over from before the user was removed.
+        const existing = this.listeners.get(userId);
+        if (existing) this.dropListener(existing);
+        this.noteIgnored(userId);
+        return;
+      }
+      if (this.listeners.has(userId)) return;
       this.subscribeToUser(userId).catch((err) => {
-        console.error(`[voice-pipeline] error subscribing to user ${userId}: ${err instanceof Error ? err.message : err}`);
+        console.error(`[voice-pipeline] error subscribing to user ${userId}: ${safeError(err)}`);
       });
     });
 
@@ -205,7 +221,7 @@ export class VoicePipeline {
             "end-to-end encryption enabled. Consider using a Stage Channel, which does not enforce DAVE.",
         );
       } else {
-        console.error(`[voice-pipeline] connection error: ${err.message}`);
+        console.error(`[voice-pipeline] connection error: ${safeError(err)}`);
       }
     });
 
@@ -297,6 +313,7 @@ export class VoicePipeline {
   // -------------------------------------------------------------------------
 
   private async subscribeToUser(userId: string): Promise<void> {
+    if (!isAllowedSpeaker(userId)) return;
     const member = this.resolveGuildMember(userId);
     if (member?.user?.bot || this.listeners.has(userId)) return;
     const receiver = this.connection?.receiver;
@@ -307,7 +324,7 @@ export class VoicePipeline {
       // Stay subscribed so pre-roll audio survives pauses and nothing is lost to resubscribing.
       stream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.Manual } }) as unknown as Readable;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = safeError(err);
       if (/DAVE|E2EE|encryption|decrypt/.test(msg)) {
         console.warn(`[voice-pipeline] cannot receive audio from user ${userId} -- likely DAVE E2EE. Try a Stage Channel.`);
       } else {
@@ -337,7 +354,7 @@ export class VoicePipeline {
     this.listeners.set(userId, listener);
 
     const onError = (source: string) => (err: Error) => {
-      console.error(`[voice-pipeline] ${source} error for user ${userId}: ${err.message}`);
+      console.error(`[voice-pipeline] ${source} error for user ${userId}: ${safeError(err)}`);
       this.dropListener(listener);
     };
     stream.on("error", onError("audio stream"));
@@ -365,7 +382,7 @@ export class VoicePipeline {
           ? setTimeout(() => this.process(listener, () => listener.speechBuffer.endOfInput()), listener.speechBuffer.endSilenceMs)
           : null;
       } catch (err) {
-        console.error(`[voice-pipeline] audio handler error for user ${listener.userId}: ${err instanceof Error ? err.message : err}`);
+        console.error(`[voice-pipeline] audio handler error for user ${listener.userId}: ${safeError(err)}`);
         this.dropListener(listener);
       }
     });
@@ -437,7 +454,7 @@ export class VoicePipeline {
         if (text) this.deliver(userId, text);
       })
       .catch((err) => {
-        console.error(`[voice-pipeline] transcription failed: ${err instanceof Error ? err.message : err}`);
+        console.error(`[voice-pipeline] transcription failed: ${safeError(err)}`);
         if (err instanceof ElevenLabsError && err.quotaExceeded) {
           this.emit(userId, "system", "[ElevenLabs quota exceeded. Transcription is unavailable until the quota resets or the plan is upgraded.]");
         }
@@ -448,9 +465,20 @@ export class VoicePipeline {
     const note = this.interruptionNote;
     this.interruptionNote = null;
     const username = this.usernameOf(userId);
-    console.error(`[voice-pipeline] ${username}: "${text}"`);
+    debugLog(`TRANSCRIPT: ${username} ${debugText("text", text)}`);
     this.emit(userId, username, note ? `${note}\n${text}` : text);
     this.scheduleBackchannel();
+  }
+
+  private readonly ignoredNoted = new Set<string>();
+
+  /** Log once per user that audio from a non-allowed speaker is being ignored. */
+  private noteIgnored(userId: string): void {
+    if (this.ignoredNoted.has(userId)) return;
+    this.ignoredNoted.add(userId);
+    if (this.ignoredNoted.size > 1000) this.ignoredNoted.clear();
+    const hint = loadAllowlist().ids.length === 0 ? ` ${allowlistHelp()}` : "";
+    console.error(`[voice-pipeline] ignoring speaker ${userId}: not on the allowlist.${hint}`);
   }
 
   private emit(userId: string, username: string, text: string): void {
@@ -517,7 +545,7 @@ export class VoicePipeline {
       silence.on("error", (err: Error) => console.warn(`[voice-pipeline] silence stream error: ${err.message}`));
       this.player.play(createAudioResource(silence, { inputType: StreamType.Arbitrary }));
     } catch (err) {
-      console.warn(`[voice-pipeline] failed to play silence: ${err instanceof Error ? err.message : err}`);
+      console.warn(`[voice-pipeline] failed to play silence: ${safeError(err)}`);
     }
   }
 

@@ -9,6 +9,7 @@
  * Docs: https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-stream-input
  */
 
+import { safeError } from "./redact.js";
 import WebSocket from "ws";
 import { PcmUpsampler } from "./audio-utils.js";
 import { debugLog } from "./debug.js";
@@ -169,7 +170,7 @@ export class TextToSpeech {
           stream.finish(error);
           return;
         }
-        console.error(`[tts] attempt ${attempt} failed, retrying: ${error.message}`);
+        console.error(`[tts] attempt ${attempt} failed, retrying: ${safeError(error)}`);
       }
     }
   }
