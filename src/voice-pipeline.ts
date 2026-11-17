@@ -10,7 +10,7 @@
  *   - Per-user SpeechBuffer with client-side VAD + adaptive noise floor
  *   - Bot audio is ignored (prevents transcribing our own TTS output)
  *   - Direct WebM Opus playback (no ffmpeg transcoding — eliminates ~200-500ms latency)
- *   - 500ms cooldown after TTS playback + audio pause during playback
+ *   - Short cooldown after TTS playback + audio pause during playback
  *   - Per-user rate limit: max 10 STT requests/minute (prevents music/noise floods)
  *   - Global concurrent STT cap: max 2 simultaneous transcriptions (queues extras)
  *   - Daily cost cap in SpeechToText ($1/day default, auto-resets at midnight)
@@ -41,17 +41,11 @@ import {
   type GuildMember,
 } from "discord.js";
 import { Readable } from "stream";
-import { appendFile } from "fs";
 import { createOpusDecoder, createDownsampler, SpeechBuffer, calculateRMS } from "./audio-utils.js";
+import { debugLog } from "./debug.js";
 import { SpeechToText } from "./stt.js";
-import { TextToSpeech } from "./tts.js";
+import { TextToSpeech, isTtsAbort } from "./tts.js";
 
-const DEBUG_LOG = "/tmp/discord-voice-debug.log";
-function debugLog(msg: string): void {
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
-  appendFile(DEBUG_LOG, line, () => {}); // async — never block the audio pipeline
-  process.stderr.write(`discord-voice-debug: ${msg}\n`);
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,7 +57,7 @@ const DEFAULT_VOICE = "en-US-JennyNeural";
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 600_000; // 10 minutes
 const TTS_COOLDOWN_MS = 200; // echo guard — slightly longer to avoid echo artifacts
 const USAGE_LOG_INTERVAL_MS = 60_000; // log STT usage every minute
-const STT_TIMEOUT_MS = 8_000; // timeout for Azure STT calls — F0 tier: 3-8s typical, fail fast on hangs
+const DEFAULT_STT_TIMEOUT_MS = 15_000; // upper bound for one Azure STT call, including its internal retry
 
 // Barge-in: RMS threshold for detecting real speech during TTS playback.
 // Must be above typical silence/noise (~200-500 RMS) and TTS echo (~500-800 RMS).
@@ -88,7 +82,6 @@ const STREAMING_TTS_CHAR_THRESHOLD = 2000; // raised from 150 — Edge TTS handl
 // Cost safeguard constants
 const MAX_STT_REQUESTS_PER_MINUTE_PER_USER = 10;
 const MAX_CONCURRENT_STT = 1; // F0 free tier allows only 1 concurrent request
-const MAX_STT_QUEUE_SIZE = 5;
 
 /**
  * A 20ms silent Opus frame (mono, 48kHz).
@@ -109,6 +102,7 @@ export interface VoicePipelineConfig {
   sttLanguage?: string;
   ttsVoice?: string;
   inactivityTimeoutMs?: number;
+  sttTimeoutMs?: number;
 }
 
 export type TranscriptionCallback = (
@@ -132,7 +126,6 @@ interface UserPipeline {
 
 export class VoicePipeline {
   private readonly client: Client;
-  private readonly config: VoicePipelineConfig;
 
   // Core audio services
   private readonly stt: SpeechToText;
@@ -160,6 +153,7 @@ export class VoicePipeline {
 
   // Inactivity
   private readonly inactivityTimeoutMs: number;
+  private readonly sttTimeoutMs: number;
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private lastGlobalActivity = Date.now();
 
@@ -180,7 +174,6 @@ export class VoicePipeline {
   private readonly sttQueue: Array<{
     userId: string;
     pcmBuffer: Buffer;
-    resolve: () => void;
   }> = [];
 
   // TTS playback state for anti-echo: true while TTS audio is playing
@@ -198,7 +191,7 @@ export class VoicePipeline {
   } | null = null;
 
   // Utterance accumulation: collect PCM chunks across VAD pauses so that
-  // multi-part speech ("Kan du... gå på... issues?") is sent as one STT request.
+  // multi-part speech ("Can you... look at... the issues?") is sent as one STT request.
   private pendingUtteranceTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingUtteranceUserId: string | null = null;
   private pendingUtteranceChunks: Buffer[] = [];
@@ -212,10 +205,10 @@ export class VoicePipeline {
 
   constructor(client: Client, config: VoicePipelineConfig) {
     this.client = client;
-    this.config = config;
     this.language = config.sttLanguage ?? DEFAULT_LANGUAGE;
     this.voice = config.ttsVoice ?? DEFAULT_VOICE;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
+    this.sttTimeoutMs = config.sttTimeoutMs ?? DEFAULT_STT_TIMEOUT_MS;
 
     this.stt = new SpeechToText({
       subscriptionKey: config.azureSttKey,
@@ -232,21 +225,13 @@ export class VoicePipeline {
     // Skip reset during streaming TTS — the streaming loop manages its own state.
     this.player.on(AudioPlayerStatus.Idle, () => {
       if (this.isStreamingTts) return; // streaming loop handles its own lifecycle
-      this.ttsIsPlaying = false;
-      this.audioPaused = false;
-      this.ttsCooldownUntil = Date.now() + TTS_COOLDOWN_MS;
-      this.isPlaying = false;
-      this.drainTtsQueue();
+      this.finishPlayback();
     });
 
     this.player.on("error", (err) => {
       console.error(`[voice-pipeline] audio player error: ${err.message}`);
       if (this.isStreamingTts) return; // streaming loop handles errors
-      this.ttsIsPlaying = false;
-      this.audioPaused = false;
-      this.ttsCooldownUntil = Date.now() + TTS_COOLDOWN_MS;
-      this.isPlaying = false;
-      this.drainTtsQueue();
+      this.finishPlayback();
     });
   }
 
@@ -751,7 +736,7 @@ export class VoicePipeline {
   /**
    * Handle a VAD utterance. Instead of sending to STT immediately, accumulate
    * PCM chunks across short pauses so that multi-part speech like
-   * "Kan du... gå på... issues?" is captured as one utterance.
+   * "Can you... look at... the issues?" is captured as one utterance.
    *
    * If a DIFFERENT user speaks while we are accumulating, the pending user's
    * buffer is flushed immediately so their partial speech is not lost.
@@ -832,7 +817,6 @@ export class VoicePipeline {
       this.sttQueue.push({
         userId,
         pcmBuffer,
-        resolve: () => {},
       });
       debugLog(`STT_QUEUED: latest-wins, ${this.activeSttCount} active`);
       this.drainSttQueue();
@@ -855,7 +839,7 @@ export class VoicePipeline {
     const sttPromise = this.stt.transcribe(pcmBuffer);
     let sttTimeoutId: ReturnType<typeof setTimeout>;
     const timeoutPromise = new Promise<null>((_, reject) => {
-      sttTimeoutId = setTimeout(() => reject(new Error(`STT timeout after ${STT_TIMEOUT_MS}ms`)), STT_TIMEOUT_MS);
+      sttTimeoutId = setTimeout(() => reject(new Error(`STT timeout after ${this.sttTimeoutMs}ms`)), this.sttTimeoutMs);
     });
 
     Promise.race([sttPromise, timeoutPromise])
@@ -867,6 +851,18 @@ export class VoicePipeline {
             userId,
             "system",
             "[STT budget reached for today. Voice transcription paused until midnight.]",
+            channelId,
+          );
+          return;
+        }
+
+        if (result?.quotaExceeded) {
+          console.error("[voice-pipeline] Azure Speech quota exceeded");
+          this.transcriptionCb?.(
+            userId,
+            "system",
+            "[Azure Speech quota exceeded (the free F0 tier allows 5 hours per month). " +
+              "Transcription is unavailable until the quota resets or the resource is upgraded.]",
             channelId,
           );
           return;
@@ -966,12 +962,17 @@ export class VoicePipeline {
       console.error(
         `[voice-pipeline] TTS playback error: ${err instanceof Error ? err.message : err}`,
       );
-      this.ttsIsPlaying = false;
-      this.audioPaused = false;
-      this.ttsCooldownUntil = Date.now() + TTS_COOLDOWN_MS;
-      this.isPlaying = false;
-      this.drainTtsQueue();
+      this.finishPlayback();
     });
+  }
+
+  /** Reset playback state, start the echo cooldown, and play the next queued item. */
+  private finishPlayback(): void {
+    this.ttsIsPlaying = false;
+    this.audioPaused = false;
+    this.ttsCooldownUntil = Date.now() + TTS_COOLDOWN_MS;
+    this.isPlaying = false;
+    this.drainTtsQueue();
   }
 
   private async synthesizeAndPlay(text: string): Promise<void> {
@@ -992,15 +993,14 @@ export class VoicePipeline {
     if (text.length <= STREAMING_TTS_CHAR_THRESHOLD) {
       try {
         await this.synthesizeAndPlaySingleShot(text);
+      } catch (err) {
+        if (!isTtsAbort(err)) throw err;
+        debugLog("TTS_SINGLE_SHOT: synthesis aborted (expected after interrupt)");
       } finally {
         // Single-shot has no finally of its own — ensure flags always reset
         // even if synthesis throws, playback is interrupted, or early-exit hits.
         // The streaming path has its own finally block at synthesizeAndPlayStreaming().
-        this.ttsIsPlaying = false;
-        this.audioPaused = false;
-        this.ttsCooldownUntil = Date.now() + TTS_COOLDOWN_MS;
-        this.isPlaying = false;
-        this.drainTtsQueue();
+        this.finishPlayback();
       }
     } else {
       await this.synthesizeAndPlayStreaming(text);
@@ -1057,6 +1057,9 @@ export class VoicePipeline {
 
         // Start prefetching next sentence while current one plays
         const prefetchPromise = generator.next();
+        // If we return early on interrupt, nobody awaits this promise; an abort
+        // rejection must not surface as an unhandled rejection.
+        prefetchPromise.catch(() => {});
         await this.playAudioBuffer(currentBuffer);
 
         // Check again after playback
@@ -1069,19 +1072,15 @@ export class VoicePipeline {
         prefetched = await prefetchPromise;
       }
     } catch (err) {
-      // "Aborted" errors are expected when interruptTts() calls tts.abort()
-      if (err instanceof Error && err.message === "Aborted") {
+      // Abort errors are expected when interruptTts() calls tts.abort()
+      if (isTtsAbort(err)) {
         debugLog("TTS_STREAMING: synthesis aborted (expected after interrupt)");
         return;
       }
       throw err;
     } finally {
       this.isStreamingTts = false;
-      this.ttsIsPlaying = false;
-      this.audioPaused = false;
-      this.ttsCooldownUntil = Date.now() + TTS_COOLDOWN_MS;
-      this.isPlaying = false;
-      this.drainTtsQueue();
+      this.finishPlayback();
     }
   }
 
