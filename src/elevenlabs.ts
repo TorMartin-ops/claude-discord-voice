@@ -43,6 +43,9 @@ export function connectSocket(
     socket.once("open", () => {
       socket.removeAllListeners("error");
       socket.removeAllListeners("unexpected-response");
+      // Permanent handler: a late protocol error on a pooled socket must never
+      // become an uncaught exception. 'close' drives recovery in the callers.
+      socket.on("error", (err) => console.error(`[elevenlabs] socket error: ${safeError(err)}`));
       resolve(socket);
     });
     socket.once("error", (err) => reject(new ElevenLabsError(safeError(err))));

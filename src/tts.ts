@@ -26,6 +26,8 @@ const OUTPUT_FORMAT = "pcm_24000";
 const INACTIVITY_TIMEOUT_SECS = "180"; // longest the API allows an idle socket to stay open
 const MAX_TEXT_LENGTH = 5000;
 const MAX_CACHED_TEXT_LENGTH = 30;
+const MAX_CACHE_BYTES = 8 * 1024 * 1024;
+const MAX_CACHE_ENTRIES = 200;
 const MAX_ATTEMPTS = 2;
 
 export interface TTSConfig {
@@ -59,6 +61,7 @@ export class TextToSpeech {
   private readonly cache = new Map<string, CachedSpeech>();
   private readonly active = new Set<SpeechStream>();
   private warm: Promise<WebSocket> | null = null;
+  private cacheBytes = 0;
   private cacheHits = 0;
   private cacheMisses = 0;
   private closed = false;
@@ -84,6 +87,8 @@ export class TextToSpeech {
 
     const cached = this.cache.get(this.cacheKey(text));
     if (cached) {
+      this.cache.delete(this.cacheKey(text)); // refresh recency
+      this.cache.set(this.cacheKey(text), cached);
       this.cacheHits++;
       stream.append(cached.pcm, cached.chars);
       stream.finish();
@@ -98,7 +103,10 @@ export class TextToSpeech {
       if (this.active.size === 0) this.warmUp();
     };
     stream.done.then(finished, finished);
-    void this.synthesize(stream, text);
+    this.synthesize(stream, text).catch((err) => {
+      console.error(`[tts] synthesis failed: ${safeError(err)}`);
+      stream.finish(err instanceof Error ? err : new Error(String(err)));
+    });
     return stream;
   }
 
@@ -222,7 +230,7 @@ export class TextToSpeech {
 
     if (stream.cancelled) return;
     if (text.length <= MAX_CACHED_TEXT_LENGTH) {
-      this.cache.set(this.cacheKey(text), { pcm: Buffer.concat(pcmParts), chars: charsSpoken });
+      this.cacheStore(this.cacheKey(text), { pcm: Buffer.concat(pcmParts), chars: charsSpoken });
     }
     stream.finish();
   }
@@ -264,6 +272,25 @@ export class TextToSpeech {
     this.warm = null;
     pending?.then((socket) => socket.close()).catch(() => {});
     this.cache.clear();
+    this.cacheBytes = 0;
+  }
+
+  /** Insert into the LRU cache (Map keeps insertion order), evicting oldest entries over the caps. */
+  private cacheStore(key: string, value: CachedSpeech): void {
+    if (value.pcm.length > MAX_CACHE_BYTES) return;
+    const old = this.cache.get(key);
+    if (old) {
+      this.cacheBytes -= old.pcm.length;
+      this.cache.delete(key);
+    }
+    this.cache.set(key, value);
+    this.cacheBytes += value.pcm.length;
+    while (this.cache.size > MAX_CACHE_ENTRIES || this.cacheBytes > MAX_CACHE_BYTES) {
+      const oldest = this.cache.keys().next();
+      if (oldest.done) break;
+      this.cacheBytes -= this.cache.get(oldest.value)!.pcm.length;
+      this.cache.delete(oldest.value);
+    }
   }
 
   private cacheKey(text: string): string {

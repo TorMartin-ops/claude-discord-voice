@@ -54,6 +54,7 @@ export class SttSession {
   private attempts = 0;
   private closed = false;
   private timeout: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private settle!: { resolve: (text: string) => void; reject: (err: Error) => void };
   private readonly result: Promise<string>;
 
@@ -142,7 +143,10 @@ export class SttSession {
       return;
     }
     console.error(`[stt] connection lost, retrying: ${safeError(err)}`);
-    setTimeout(() => !this.closed && this.connect(), RECONNECT_DELAY_MS);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.closed) this.connect();
+    }, RECONNECT_DELAY_MS);
   }
 
   private sendAudio(pcm: Buffer | null, commit: boolean): void {
@@ -194,6 +198,8 @@ export class SttSession {
     if (this.closed) return;
     this.closed = true;
     if (this.timeout) clearTimeout(this.timeout);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     this.socket?.close();
     this.socket = null;
     this.onClosed(this.bytes / BYTES_PER_SECOND, transcribed);

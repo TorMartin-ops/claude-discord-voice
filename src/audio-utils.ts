@@ -219,29 +219,52 @@ interface SileroModel {
   reset_state(): void;
 }
 
-let _cachedModel: SileroModel | null = null;
+interface SharedSilero {
+  // Immutable ONNX session (weights) shared by every listener.
+  create(): SileroModel;
+}
 
-async function loadSileroV5(): Promise<SileroModel> {
-  if (_cachedModel) return _cachedModel;
+let _shared: Promise<SharedSilero> | null = null;
 
-  // Load onnxruntime-node and SileroV5 model class from avr-vad
-  const require_ = createRequire(import.meta.url);
-  const ort = require_("onnxruntime-node");
-  const { SileroV5 } = require_("avr-vad/dist/common/models");
+/**
+ * Load the ONNX session once and hand out a fresh SileroV5 wrapper per
+ * listener. The recurrent state lives in the wrapper, so speakers never
+ * influence each other's speech detection.
+ */
+function loadSileroV5(): Promise<SharedSilero> {
+  if (_shared) return _shared;
+  _shared = (async () => {
+    const require_ = createRequire(import.meta.url);
+    const ort = require_("onnxruntime-node");
+    const { SileroV5 } = require_("avr-vad/dist/common/models");
 
-  // Locate the bundled ONNX model file
-  const avrVadPath = dirname(require_.resolve("avr-vad/package.json"));
-  const modelPath = resolve(avrVadPath, "dist", "silero_vad_v5.onnx");
-
-  // Custom model fetcher: read from disk instead of fetch()
-  const modelFetcher = async (): Promise<ArrayBuffer> => {
+    const avrVadPath = dirname(require_.resolve("avr-vad/package.json"));
+    const modelPath = resolve(avrVadPath, "dist", "silero_vad_v5.onnx");
     const buf = readFileSync(modelPath);
-    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-  };
+    const modelBytes = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 
-  _cachedModel = await SileroV5.new(ort, modelFetcher) as SileroModel;
-  console.error("[speech-buffer] Silero VAD v5 loaded (ONNX, 16kHz, 512-sample frames)");
-  return _cachedModel;
+    // Build one model to obtain the shared session and sample-rate tensor.
+    const first = await SileroV5.new(ort, async () => modelBytes);
+    const session = first._session;
+    const sr = first._sr;
+    const freshState = () => new ort.Tensor("float32", Array(2 * 128).fill(0), [2, 1, 128]);
+    console.error("[speech-buffer] Silero VAD v5 loaded (ONNX, 16kHz, 512-sample frames)");
+
+    let handedFirst = false;
+    return {
+      create(): SileroModel {
+        if (!handedFirst) {
+          handedFirst = true;
+          return first as SileroModel;
+        }
+        return new SileroV5(session, freshState(), sr, ort) as SileroModel;
+      },
+    };
+  })().catch((err) => {
+    _shared = null; // allow a retry on the next listener
+    throw err;
+  });
+  return _shared;
 }
 
 /**
@@ -299,7 +322,7 @@ export class SpeechBuffer {
   }
 
   static async create(options: SpeechBufferOptions = {}): Promise<SpeechBuffer> {
-    return new SpeechBuffer(await loadSileroV5(), options);
+    return new SpeechBuffer((await loadSileroV5()).create(), options);
   }
 
   /** True while an utterance is in progress (confirmed speech, not yet ended). */
@@ -341,6 +364,8 @@ export class SpeechBuffer {
     const events: SpeechEvent[] = this.state === State.SPEAKING ? [this.endUtterance()] : [];
     this.state = State.WAITING;
     this.candidate = [];
+    this.frameAccumulator = Buffer.alloc(0);
+    this.resetVad();
     return events;
   }
 
@@ -399,8 +424,18 @@ export class SpeechBuffer {
     const durationMs = this.totalAudioMs - this.speechStartMs;
     const speechRatio = this.totalFrames > 0 ? this.speechFrames / this.totalFrames : 0;
     this.state = State.WAITING;
+    this.resetVad();
     // Short blips and mostly-noise segments would only produce hallucinated text.
     return { type: "end", discard: durationMs < this.minSpeechDurationMs || speechRatio < MIN_SPEECH_RATIO };
+  }
+
+  /** Clear the recurrent state so one utterance never leaks into the next. */
+  private resetVad(): void {
+    try {
+      this.vad.reset_state();
+    } catch {
+      // state reset is best-effort
+    }
   }
 
   private async classify(frame: Buffer): Promise<boolean> {
