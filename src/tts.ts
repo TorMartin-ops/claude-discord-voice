@@ -168,6 +168,18 @@ const CACHED_PHRASES: ReadonlyArray<string> = [
 // Types
 // ---------------------------------------------------------------------------
 
+/** Thrown when synthesis is cancelled via TextToSpeech.abort(). Expected during barge-in. */
+export class TtsAbortError extends Error {
+  constructor() {
+    super("Aborted");
+    this.name = "TtsAbortError";
+  }
+}
+
+export function isTtsAbort(err: unknown): boolean {
+  return err instanceof TtsAbortError;
+}
+
 export interface TTSConfig {
   /** TTS voice name. Default: 'en-US-JennyNeural' */
   voice?: string;
@@ -193,7 +205,7 @@ function makeRequestId(): string {
   return randomUUID().replace(/-/g, "");
 }
 
-function buildSpeechConfigMessage(requestId: string): string {
+function buildSpeechConfigMessage(): string {
   const config = JSON.stringify({
     context: {
       synthesis: {
@@ -409,7 +421,7 @@ export class TextToSpeech {
 
     for (const sentence of sentences) {
       if (this.aborted) {
-        throw new Error("Aborted");
+        throw new TtsAbortError();
       }
 
       const cacheKey = this.cacheKey(sentence);
@@ -427,14 +439,14 @@ export class TextToSpeech {
         audio = await this.synthesizeViaWebSocket(sentence);
       } catch (firstErr) {
         // Abort is non-recoverable — rethrow to stop the stream
-        if (this.aborted || (firstErr instanceof Error && firstErr.message === "Aborted")) {
+        if (this.aborted || isTtsAbort(firstErr)) {
           throw firstErr;
         }
         // Retry once on transient errors (code 1007, connection drops)
         try {
           audio = await this.synthesizeViaWebSocket(sentence);
         } catch (retryErr) {
-          if (this.aborted || (retryErr instanceof Error && retryErr.message === "Aborted")) {
+          if (this.aborted || isTtsAbort(retryErr)) {
             throw retryErr;
           }
           // Both attempts failed — skip this sentence, continue
@@ -446,7 +458,7 @@ export class TextToSpeech {
       }
 
       if (this.aborted) {
-        throw new Error("Aborted");
+        throw new TtsAbortError();
       }
 
       if (this.shouldCache(sentence)) {
@@ -469,14 +481,14 @@ export class TextToSpeech {
    * Abort any ongoing synthesis.
    *
    * Sets the aborted flag (checked by synthesize/synthesizeChunked) and
-   * rejects all pending WebSocket requests with an "Aborted" error.
+   * rejects all pending WebSocket requests with a TtsAbortError.
    */
   abort(): void {
     this.aborted = true;
 
     for (const [id, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
-      pending.reject(new Error("Aborted"));
+      pending.reject(new TtsAbortError());
       this.pendingRequests.delete(id);
     }
   }
@@ -665,7 +677,7 @@ export class TextToSpeech {
 
     // Handle HTTP error responses during WebSocket upgrade (e.g., 403 auth failure).
     // The ws library emits 'unexpected-response' instead of 'error' for these.
-    ws.on("unexpected-response" as any, (req: any, res: any) => {
+    ws.on("unexpected-response" as any, (_req: unknown, res: any) => {
       const statusCode = res?.statusCode ?? 0;
       console.error(`[tts] Edge TTS WebSocket upgrade failed: HTTP ${statusCode}`);
 
@@ -793,7 +805,7 @@ export class TextToSpeech {
    */
   private async synthesizeViaWebSocket(text: string): Promise<Buffer> {
     if (this.aborted) {
-      throw new Error("Aborted");
+      throw new TtsAbortError();
     }
 
     await this.ensureWebSocket();
@@ -822,7 +834,7 @@ export class TextToSpeech {
       });
 
       // Send speech config + SSML for this request.
-      ws.send(buildSpeechConfigMessage(requestId));
+      ws.send(buildSpeechConfigMessage());
       ws.send(
         buildSSMLMessage(requestId, text, this.voice, this.rate, this.volume, this.pitch),
       );

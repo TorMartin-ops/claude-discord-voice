@@ -16,20 +16,14 @@ Discord voice channel plugin for [Claude Code](https://docs.anthropic.com/en/doc
 
 These are the main problems that need fixing. If you want to contribute, these are great places to start:
 
-### TTS abort crash
-The `TextToSpeech.abort()` method throws an unhandled `Error: Aborted` when barge-in interrupts playback mid-stream. The error propagates from the audio transform pipeline and crashes the process. Needs proper error handling around the interrupt flow in `voice-pipeline.ts`.
-
 ### Notification delivery is unreliable
 MCP notifications (`notifications/claude/channel`) are sometimes silently dropped by Claude Code. The plugin has a `poll_queue` fallback that writes transcriptions to disk, but Claude Code doesn't always poll it. This means spoken messages can get lost.
 
 ### Azure F0 free tier limitations
-The free Azure Speech tier only allows 1 concurrent STT request and 5 hours/month. The plugin works around this with a concurrent request cap, but heavy use will hit the monthly limit fast. Needs better error messaging when the budget is exhausted.
+The free Azure Speech tier only allows 1 concurrent STT request and 5 hours/month. The plugin works around this with a concurrent request cap, but heavy use will hit the monthly limit fast. When Azure reports the quota as exhausted, the plugin tells Claude so instead of silently dropping speech.
 
 ### Anti-echo can still cause dead zones
-After TTS playback, there's a 500ms cooldown where user speech is ignored to prevent the bot from transcribing its own output. This sometimes causes the first word of a user's response to be clipped. A smarter approach (e.g., audio fingerprinting or stream-level echo cancellation) would improve conversation flow.
-
-### STT timeout can lose speech
-A 10-second hard timeout wraps `stt.transcribe()` to prevent hung Azure calls from blocking forever. But if Azure is just slow (not hung), this silently drops valid transcriptions. Needs a retry or partial-result mechanism.
+After TTS playback, there is a short (200ms) cooldown where user speech is ignored to prevent the bot from transcribing its own output. This sometimes causes the first word of a user's response to be clipped. A smarter approach (e.g., audio fingerprinting or stream-level echo cancellation) would improve conversation flow.
 
 ## Prerequisites
 
@@ -78,6 +72,8 @@ AZURE_SPEECH_KEY=your-key
 AZURE_SPEECH_REGION=eastus
 VOICE_DEFAULT_LANGUAGE=en-US          # optional
 VOICE_DEFAULT_VOICE=en-US-JennyNeural # optional
+VOICE_STT_TIMEOUT_MS=15000            # optional, max wait for one Azure STT call
+VOICE_DEBUG=1                         # optional, verbose debug logging to stderr
 ```
 
 See `.env.example` for a template.
@@ -114,6 +110,7 @@ Discord playback <- WebM Opus <- Edge TTS <- Claude response
 |------|---------|
 | `src/server.ts` | MCP server — tool definitions, credential loading, Discord client setup |
 | `src/voice-pipeline.ts` | Orchestrator — wires audio receive, STT, TTS, and playback into a per-channel pipeline |
+| `src/debug.ts` | Opt-in debug logging (`VOICE_DEBUG=1`) |
 | `src/stt.ts` | Azure Speech-to-Text wrapper with cost tracking, budget caps, and retry logic |
 | `src/tts.ts` | Edge TTS WebSocket client with DRM auth, SSML generation, and streaming |
 | `src/audio-utils.ts` | Opus decoding, downsampling (48kHz -> 16kHz), VAD (Silero v5), noise floor calibration |
@@ -131,11 +128,10 @@ This plugin is in early alpha and needs help! Here's how to get started:
 
 ### Priority areas for contribution
 
-- **Fix the TTS abort crash** — proper error handling in `voice-pipeline.ts` when barge-in interrupts playback
 - **Improve notification reliability** — investigate why MCP notifications get dropped and find a better delivery mechanism
 - **Better echo cancellation** — replace the cooldown timer with something smarter
 - **Multi-user support** — test and fix issues with multiple people in the same voice channel
-- **Error messages** — better user-facing errors when Azure credentials are wrong, budget is exhausted, etc.
+- **Error messages** — better user-facing errors when Azure credentials are wrong
 - **Tests** — there are currently no tests; adding even basic unit tests for STT/TTS would be valuable
 
 ## License
