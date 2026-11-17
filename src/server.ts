@@ -309,6 +309,76 @@ function makePipelineConfig(): VoicePipelineConfig {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Delivery tracking
+// ---------------------------------------------------------------------------
+// Claude Code gives no acknowledgement for channel notifications, and drops
+// them silently if the server is not a registered channel. Calling a reply or
+// queue tool is treated as proof that Claude is receiving transcripts.
+
+const ACK_WINDOW_MS = 20_000
+const NOTICE_TEXT =
+  'Claude is not receiving voice messages. Start Claude Code with the development channels flag.'
+
+type PendingEntry = Omit<QueuedMessage, 'delivered'>
+const pendingAcks = new Map<string, { entry: PendingEntry; lastSentAt: number; resends: number }>()
+let transcriptCounter = 0
+let noticeSpoken = false
+
+function sendChannelNotification(msgId: string, entry: PendingEntry): void {
+  // Meta keys must be identifiers (letters, digits, underscore) and values strings,
+  // otherwise Claude Code drops them silently.
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: neutraliseContent(entry.content),
+      meta: {
+        chat_id: entry.channel_id,
+        user: entry.user,
+        user_id: entry.user_id,
+        msg_id: msgId,
+        ts: entry.ts,
+        source: 'discord-voice',
+        language: entry.language,
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord-voice: NOTIFY_FAILED: ${safeError(err)} — message is in queue for poll_queue\n`)
+  })
+}
+
+/** Called whenever Claude uses a tool that proves it is receiving transcripts. */
+function ackAll(): void {
+  pendingAcks.clear()
+}
+
+const ackTimer = setInterval(() => {
+  if (pendingAcks.size === 0) return
+  // While the bot is speaking Claude is clearly working (or about to be cut off); wait.
+  if (pipeline && pipeline.busy) return
+  const now = Date.now()
+  for (const [id, p] of pendingAcks) {
+    if (now - p.lastSentAt < ACK_WINDOW_MS) continue
+    if (p.resends === 0) {
+      p.resends = 1
+      p.lastSentAt = now
+      process.stderr.write(`discord-voice: transcript ${id} unacknowledged after ${ACK_WINDOW_MS / 1000}s, re-sending once\n`)
+      sendChannelNotification(id, p.entry)
+    } else {
+      pendingAcks.delete(id)
+      process.stderr.write(
+        `discord-voice: transcript ${id} still unacknowledged. Claude Code is probably not running with this server as a channel ` +
+        `(claude --dangerously-load-development-channels ...). The message remains available via poll_queue.\n`,
+      )
+      if (!noticeSpoken && pipeline && pipeline.status.connected) {
+        noticeSpoken = true
+        pipeline.playResponse(NOTICE_TEXT).catch(() => {})
+      }
+    }
+  }
+}, 5_000)
+ackTimer.unref()
+
 let pipeline: VoicePipeline | null = null
 
 function ensurePipeline(): VoicePipeline {
@@ -336,22 +406,17 @@ function ensurePipeline(): VoicePipeline {
 
       // The channel notification is the primary delivery path and goes out
       // immediately; the file queue below is only the poll_queue fallback.
-      mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: neutraliseContent(text),
-          meta: {
-            chat_id: channelId,
-            user: username,
-            user_id: userId,
-            ts,
-            source: 'discord-voice',
-            language: sttLanguage || 'auto',
-          },
-        },
-      }).catch(err => {
-        process.stderr.write(`discord-voice: NOTIFY_FAILED: ${safeError(err)} — message is in queue for poll_queue\n`)
-      })
+      const msgId = String(++transcriptCounter)
+      const entry = {
+        content: text,
+        channel_id: channelId,
+        user: username,
+        user_id: userId,
+        ts,
+        language: sttLanguage || 'auto',
+      }
+      pendingAcks.set(msgId, { entry, lastSentAt: Date.now(), resends: 0 })
+      sendChannelNotification(msgId, entry)
 
       enqueueVoiceMessage({
         content: text,
@@ -645,6 +710,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // voice_reply (TTS)
     // -----------------------------------------------------------------
     case 'voice_reply': {
+      ackAll()
       const text = strArg(args, 'text')
       if (!text) {
         return { content: [{ type: 'text', text: 'No text provided.' }] }
@@ -677,6 +743,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // voice_text_reply (send text message to guild channel)
     // -----------------------------------------------------------------
     case 'voice_text_reply': {
+      ackAll()
       const text = strArg(args, 'text')
       const channelId = strArg(args, 'channel_id')
       if (!text) {
@@ -971,6 +1038,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // poll_queue
     // -----------------------------------------------------------------
     case 'poll_queue': {
+      ackAll()
       const rawLimit = Number((args as ToolArgs | undefined)?.limit)
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(Math.floor(rawLimit), 100)) : 10
       const entries = readUndelivered(limit)
@@ -990,6 +1058,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // voice_latest — simplified single-message retrieval
     // -----------------------------------------------------------------
     case 'voice_latest': {
+      ackAll()
       const entries = readUndelivered(1)
       if (entries.length === 0) {
         return { content: [{ type: 'text', text: '(no undelivered voice messages)' }] }

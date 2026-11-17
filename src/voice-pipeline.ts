@@ -124,6 +124,11 @@ export class VoicePipeline {
     this.transcriptionCb = cb;
   }
 
+  /** True while a reply is being spoken or queued. */
+  get busy(): boolean {
+    return this.playback.busy;
+  }
+
   get isDestroyed(): boolean {
     return this.destroyed;
   }

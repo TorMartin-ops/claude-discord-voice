@@ -108,3 +108,20 @@ If the plugin is not running, say so and suggest joining a voice channel first.
 - One key covers both directions; there is no region setting.
 - Privacy note: audio and text are processed by ElevenLabs. Check the
   account's data retention settings if that matters for the user's use case.
+
+---
+
+## Starting Claude Code with the voice channel
+
+Transcripts arrive as `notifications/claude/channel`, which Claude Code drops
+silently unless the server is registered as a channel. Tell the user to start
+Claude Code with:
+
+```
+claude --dangerously-load-development-channels plugin:discord-voice@local
+```
+
+(`server:discord-voice` if it runs from a plain `.mcp.json`). Without this flag
+voice messages are dropped and the bot will announce that Claude is not
+receiving them. Also mention `VOICE_ALLOWED_USERS` must list the Discord user
+IDs allowed to speak.

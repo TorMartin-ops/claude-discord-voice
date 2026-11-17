@@ -18,9 +18,6 @@ Discord voice channel plugin for [Claude Code](https://docs.anthropic.com/en/doc
 
 These are the main problems that need fixing. If you want to contribute, these are great places to start:
 
-### Notification delivery is unreliable
-MCP notifications (`notifications/claude/channel`) are sometimes silently dropped by Claude Code. The plugin has a `poll_queue` fallback that writes transcriptions to disk, but Claude Code doesn't always poll it. This means spoken messages can get lost.
-
 ### ElevenLabs plan limits
 Usage is billed per hour of audio (STT) and per character (TTS) against your ElevenLabs plan, and plans have concurrency limits. The plugin caps daily usage (3600 s of audio, 50000 characters) and tells Claude when ElevenLabs reports the quota as exhausted instead of silently dropping speech. See the [ElevenLabs API pricing](https://elevenlabs.io/pricing/api) for current rates.
 
@@ -67,6 +64,23 @@ claude plugins enable discord-voice@local
 ```
 
 The Discord bot token is shared with the [text Discord plugin](https://github.com/anthropics/claude-code). Set it up with `/discord:configure <token>` if you haven't already.
+
+## Start Claude Code with the voice channel
+
+Voice transcripts reach Claude as channel notifications (`notifications/claude/channel`). Claude Code silently drops these from any server it has not registered as a channel for the session. During the research preview only Anthropic-allowlisted plugins can use plain `--channels`, so start Claude Code like this:
+
+```bash
+claude --dangerously-load-development-channels plugin:discord-voice@local
+```
+
+If you run the server from a plain `.mcp.json` entry instead of a plugin, use `server:discord-voice`. Without this flag the plugin still joins and transcribes, but Claude never sees what you say. See the [channels reference](https://code.claude.com/docs/en/channels-reference).
+
+Notes:
+
+- Transcripts sent while Claude is busy are queued by Claude Code and delivered together on its next turn.
+- There is no delivery receipt. The plugin treats a call to `voice_reply`, `voice_text_reply`, `voice_latest` or `poll_queue` as acknowledgement. If nothing acknowledges a transcript within about 20 seconds while the bot is idle, it is re-sent once. If it is still unacknowledged, the bot says once per session that Claude is not receiving voice messages, and the stderr log explains why.
+- `poll_queue` and `voice_latest` remain as a fallback; they are not the main path.
+- Barge-in is handled locally by the plugin and does not depend on the text Discord plugin, which only shares the bot token file.
 
 ## Configuration
 
