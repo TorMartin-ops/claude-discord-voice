@@ -1,20 +1,20 @@
 /**
  * Discord voice channel for Claude Code.
  *
- * MCP server that joins Discord voice channels, transcribes speech via Azure
- * STT, and speaks responses via Edge TTS. Transcriptions arrive in Claude Code
- * as channel notifications — the same mechanism the text Discord plugin uses.
+ * MCP server that joins Discord voice channels, transcribes speech with
+ * ElevenLabs realtime STT, and speaks responses with ElevenLabs streaming TTS.
+ * Transcriptions arrive in Claude Code as channel notifications — the same
+ * mechanism the text Discord plugin uses.
  *
  * Delegates all audio pipeline work to VoicePipeline, which handles:
- *   - Per-user Opus decode -> downsample -> VAD -> Azure STT
- *   - TTS queuing with echo prevention (cooldown after playback)
- *   - Direct OggOpus playback (no ffmpeg transcoding needed)
+ *   - Per-user Opus decode -> downsample -> VAD -> streaming STT
+ *   - Streaming TTS playback with instant barge-in
  *   - Inactivity auto-disconnect (10 min default)
  *   - Silence trick so Discord forwards incoming audio
  *
  * Credentials:
  *   - DISCORD_BOT_TOKEN from ~/.claude/channels/discord/.env (shared with text plugin)
- *   - AZURE_SPEECH_KEY + AZURE_SPEECH_REGION from env or ~/.claude/channels/discord-voice/.env
+ *   - ELEVENLABS_API_KEY from env or ~/.claude/channels/discord-voice/.env
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -35,6 +35,7 @@ import { readFileSync, writeFileSync, chmodSync, appendFileSync, mkdirSync, read
 import { homedir } from 'os'
 import { join } from 'path'
 import { VoicePipeline, type VoicePipelineConfig } from './voice-pipeline.js'
+import { DEFAULT_VOICE } from './tts.js'
 import { debugLog } from './debug.js'
 
 // ---------------------------------------------------------------------------
@@ -60,12 +61,11 @@ function loadEnvFile(path: string): void {
 
 // Shared Discord token from the text plugin's .env
 loadEnvFile(DISCORD_ENV_FILE)
-// Voice-specific credentials (Azure Speech)
+// Voice-specific credentials (ElevenLabs)
 loadEnvFile(VOICE_ENV_FILE)
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
-const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY
-const AZURE_SPEECH_REGION = process.env.AZURE_SPEECH_REGION
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY?.trim()
 
 if (!TOKEN) {
   process.stderr.write(
@@ -76,12 +76,11 @@ if (!TOKEN) {
   process.exit(1)
 }
 
-if (!AZURE_SPEECH_KEY?.trim() || !AZURE_SPEECH_REGION?.trim()) {
+if (!ELEVENLABS_API_KEY) {
   process.stderr.write(
-    `discord-voice: Azure Speech credentials required (must be non-empty)\n` +
+    `discord-voice: ElevenLabs API key required\n` +
     `  set in ${VOICE_ENV_FILE} or env vars:\n` +
-    `  AZURE_SPEECH_KEY=...\n` +
-    `  AZURE_SPEECH_REGION=eastus\n`,
+    `  ELEVENLABS_API_KEY=...\n`,
   )
   process.exit(1)
 }
@@ -215,8 +214,9 @@ process.on('uncaughtException', err => {
 // State
 // ---------------------------------------------------------------------------
 
-let sttLanguage = process.env.VOICE_DEFAULT_LANGUAGE ?? 'en-US'
-let ttsVoice = process.env.VOICE_DEFAULT_VOICE ?? 'en-US-JennyNeural'
+// Empty language means automatic detection.
+let sttLanguage = process.env.VOICE_DEFAULT_LANGUAGE?.trim() ?? ''
+let ttsVoice = process.env.VOICE_DEFAULT_VOICE?.trim() || DEFAULT_VOICE
 
 // Session-level tracking for voice_costs (survives pipeline recreation)
 let sessionStartedAt: number | null = null
@@ -242,13 +242,20 @@ function parsePositiveInt(value: string | undefined): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined
 }
 
+// Optional filler such as "mm" spoken when Claude is slow to answer. Off unless set.
+const backchannelText = process.env.VOICE_BACKCHANNEL?.trim()
+
 function makePipelineConfig(): VoicePipelineConfig {
   return {
-    azureSttKey: AZURE_SPEECH_KEY!,
-    azureSttRegion: AZURE_SPEECH_REGION!,
-    sttLanguage,
-    ttsVoice,
+    elevenLabsApiKey: ELEVENLABS_API_KEY!,
+    sttModel: process.env.ELEVENLABS_STT_MODEL?.trim() || undefined,
+    ttsModel: process.env.ELEVENLABS_TTS_MODEL?.trim() || undefined,
+    language: sttLanguage || undefined,
+    voice: ttsVoice,
     sttTimeoutMs: parsePositiveInt(process.env.VOICE_STT_TIMEOUT_MS),
+    backchannel: backchannelText
+      ? { text: backchannelText, delayMs: parsePositiveInt(process.env.VOICE_BACKCHANNEL_DELAY_MS) ?? 1500 }
+      : undefined,
   }
 }
 
@@ -270,21 +277,11 @@ function ensurePipeline(): VoicePipeline {
       sessionStartedAt = Date.now()
     }
 
-    // When transcription arrives, dispatch MCP notification immediately so
-    // Claude Code sees it in real-time. File queue remains as fallback.
-    pipeline.onTranscription(async (userId, username, text, channelId) => {
+    pipeline.onTranscription((userId, username, text, channelId) => {
       const ts = new Date().toISOString()
-      enqueueVoiceMessage({
-        content: text,
-        channel_id: channelId,
-        user: username,
-        user_id: userId,
-        ts,
-        language: sttLanguage,
-        delivered: false,
-      })
 
-      // Fire MCP notification immediately
+      // The channel notification is the primary delivery path and goes out
+      // immediately; the file queue below is only the poll_queue fallback.
       mcp.notification({
         method: 'notifications/claude/channel',
         params: {
@@ -293,17 +290,47 @@ function ensurePipeline(): VoicePipeline {
             chat_id: channelId,
             user: username,
             user_id: userId,
-            ts: new Date().toISOString(),
+            ts,
             source: 'discord-voice',
-            language: sttLanguage,
+            language: sttLanguage || 'auto',
           },
         },
       }).catch(err => {
         process.stderr.write(`discord-voice: NOTIFY_FAILED: ${err instanceof Error ? err.message : err} — message is in queue for poll_queue\n`)
       })
+
+      enqueueVoiceMessage({
+        content: text,
+        channel_id: channelId,
+        user: username,
+        user_id: userId,
+        ts,
+        language: sttLanguage || 'auto',
+        delivered: false,
+      })
     })
   }
   return pipeline
+}
+
+function usageLines(status: VoicePipeline['status']): string[] {
+  const { sttUsage: stt, ttsUsage: tts, ttsCache } = status
+  const pct = (used: number, limit: number) => ((used / limit) * 100).toFixed(1)
+  const lines = [
+    '--- STT (ElevenLabs Scribe) ---',
+    `Audio today: ${stt.used.toFixed(1)}s (${(stt.used / 60).toFixed(1)} min), ${stt.transcriptions} transcriptions`,
+    `Daily budget: ${stt.limit}s, ${stt.remaining.toFixed(0)}s remaining (${pct(stt.used, stt.limit)}% used)`,
+    `Budget resets: ${stt.resetAt}`,
+    stt.exhausted ? '*** STT BUDGET EXHAUSTED — transcription paused until reset ***' : '',
+    '',
+    '--- TTS (ElevenLabs) ---',
+    `Characters today: ${tts.used}`,
+    `Daily budget: ${tts.limit} characters, ${tts.remaining} remaining (${pct(tts.used, tts.limit)}% used)`,
+    `Budget resets: ${tts.resetAt}`,
+    tts.exhausted ? '*** TTS BUDGET EXHAUSTED — speech paused until reset ***' : '',
+    `Cache hits: ${ttsCache.hits} / misses: ${ttsCache.misses}`,
+  ]
+  return lines
 }
 
 // ---------------------------------------------------------------------------
@@ -326,18 +353,19 @@ const mcp = new Server(
       '  - When a text user writes (source="discord"), respond with reply (from the text plugin) so they read the answer.',
       '  - Use voice_text_reply to send a TEXT message to the guild\'s text channel while in a voice call — useful for sharing links, code snippets, formatted text, or long responses that are better read than heard.',
       '',
-      'Voice interruption:',
-      '  - If the user speaks during TTS playback, the bot automatically pauses incoming audio processing and resumes after playback finishes.',
-      '  - Use the voice_interrupt tool to manually stop TTS playback immediately (e.g. when the user wants to cut off a long response).',
+      'Voice conversation — speed matters, the user is waiting in real time:',
+      '  - Call voice_reply EARLY. Do not compose a long answer first: speak the answer in the first sentence right away, then call voice_reply again with the next sentence(s). Calls queue up and play back to back without gaps.',
+      '  - Keep each voice_reply short (one or two sentences) and conversational. Answer first, details after, and only if they add something.',
+      '  - Interruptions: the user can cut in at any time. The bot stops talking instantly and drops everything queued. Their next message starts with a bracketed note saying where they interrupted and what they did not hear. Do not repeat what they already heard; respond to what they just said.',
+      '  - Use the voice_interrupt tool only to stop speech yourself (e.g. when the topic changed).',
       '',
-      'The user speaks in the configured STT language (check voice_status for current setting).',
+      'The user speaks in the configured STT language (check voice_status for current setting; "auto" means detected per utterance).',
       '',
       'Voice personality & style (IMPORTANT — follow strictly for all voice_reply output):',
       '  - Tone: crisp, confident, dry wit. Never robotic, never rambling.',
-      '  - Be concise but complete — give the full answer, just without the fluff.',
       '  - Lead with the answer, not the reasoning. Skip filler ("Let me see...", "Of course...", "I will...").',
       '  - Use natural spoken language — contractions, rhythm. Not written-text-read-aloud.',
-      '  - Dense, not sparse: pack information tight. "Three errors in the auth module: two type errors and a missing import" — not five sentences saying the same.',
+      '  - Dense, not sparse: "Three errors in the auth module: two type errors and a missing import" — not five sentences saying the same.',
       '  - For long output (tables, code, lists): give the summary via voice, full details via voice_text_reply.',
       '  - Gentle humor when it fits — a raised eyebrow, not a comedy routine.',
     ].join('\n'),
@@ -370,11 +398,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'voice_reply',
       description:
-        'Speak text aloud in the current voice channel via TTS. The bot must already be in a voice channel.',
+        'Speak text aloud in the current voice channel. Speech starts within a fraction of a second, and repeated calls queue behind each other, so speak the first sentence immediately and follow up with more calls instead of composing one long reply. The bot must already be in a voice channel.',
       inputSchema: {
         type: 'object' as const,
         properties: {
-          text: { type: 'string', description: 'Text to speak aloud' },
+          text: { type: 'string', description: 'One or two short, conversational sentences to speak next' },
         },
         required: ['text'],
       },
@@ -419,11 +447,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'voice_set_language',
       description:
-        'Change the STT recognition language. Examples: nb-NO, en-US, nn-NO, sv-SE.',
+        'Change the speech language (STT hint and TTS pronunciation). Examples: nb-NO, en-US, sv-SE. Applies immediately.',
       inputSchema: {
         type: 'object' as const,
         properties: {
-          language: { type: 'string', description: "BCP-47 language tag, e.g. 'nb-NO', 'en-US'" },
+          language: { type: 'string', description: "BCP-47 language tag, e.g. 'nb-NO', 'en-US'. Use 'auto' to detect the language automatically." },
         },
         required: ['language'],
       },
@@ -431,11 +459,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'voice_set_voice',
       description:
-        'Change the TTS voice. English voices: en-US-JennyNeural, en-US-GuyNeural, en-US-AriaNeural. See Edge TTS docs for other languages.',
+        'Change the TTS voice. Takes an ElevenLabs voice_id (see the voice library in your ElevenLabs account).',
       inputSchema: {
         type: 'object' as const,
         properties: {
-          voice: { type: 'string', description: "TTS voice name, e.g. 'en-US-JennyNeural'" },
+          voice: { type: 'string', description: "ElevenLabs voice_id, e.g. 'JBFqnCBsd6RMkjVDRZzb'" },
         },
         required: ['voice'],
       },
@@ -516,7 +544,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: `Joined voice channel "${channel.name}" in ${guild.name}.\n` +
-              `Listening for speech (${sttLanguage}), TTS voice: ${ttsVoice}.\n` +
+              `Listening for speech (${sttLanguage || 'auto language'}), TTS voice: ${ttsVoice}.\n` +
               `Users in channel: ${members.length > 0 ? members.join(', ') : '(empty)'}`,
           }],
         }
@@ -545,8 +573,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{
           type: 'text',
           text: `Left voice channel.\n` +
-            `STT session: ${status.sttUsage.totalSeconds.toFixed(1)}s audio processed, ` +
-            `$${status.sttUsage.estimatedCostUSD.toFixed(4)} est. cost.`,
+            `Today: ${status.sttUsage.used.toFixed(1)}s of audio transcribed, ${status.ttsUsage.used} characters spoken.`,
         }],
       }
     }
@@ -564,27 +591,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: 'Not in a voice channel. Use voice_join first.' }] }
       }
 
-      // Interrupt any current playback
-      pipeline.interrupt()
-
-      const isChunked = text.length > 200
-
       // Fire-and-forget — don't await, so Claude can process new transcriptions
       pipeline.playResponse(text).catch(err => {
         process.stderr.write(`discord-voice: TTS background error: ${err instanceof Error ? err.message : err}\n`)
       })
 
       const preview = text.length > 100 ? text.slice(0, 100) + '...' : text
-      const chunkedNote = isChunked
-        ? ` (${text.length} chars, using chunked synthesis)`
-        : ''
-
       debugLog(`voice_reply: fire-and-forget TTS started for ${text.length} chars`)
 
       return {
         content: [{
           type: 'text',
-          text: `Spoke: "${preview}"${chunkedNote}`,
+          text: `Speaking: "${preview}"`,
         }],
       }
     }
@@ -703,54 +721,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      const stt = pipelineStatus.sttUsage
-      const tts = pipelineStatus.ttsCache
-
-      // Calculate session duration
-      const sessionDurationMs = sessionStartedAt ? Date.now() - sessionStartedAt : 0
-      const sessionDurationMin = sessionDurationMs / 60_000
-      const sessionDurationHrs = sessionDurationMs / 3_600_000
-
-      // STT cost details: Azure charges $1/hr of audio
-      const sttCostPerHour = 1.0
-      const sttMinutesUsed = stt.totalSeconds / 60
-
-      // Projected monthly cost based on current usage rate
-      let projectedMonthlyUSD = 0
-      if (sessionDurationHrs > 0) {
-        const costPerHourOfSession = stt.estimatedCostUSD / sessionDurationHrs
-        // Assume 8 hours/day active use, 22 working days/month
-        projectedMonthlyUSD = costPerHourOfSession * 8 * 22
-      }
-
-      // TTS details: Edge TTS is free but rate-limited
-      const ttsTotalRequests = tts.hits + tts.misses
-      const ttsCacheHitRate = ttsTotalRequests > 0
-        ? ((tts.hits / ttsTotalRequests) * 100).toFixed(1)
-        : '0.0'
+      const sessionDurationMin = sessionStartedAt ? (Date.now() - sessionStartedAt) / 60_000 : 0
 
       const lines = [
-        '=== Voice Session Cost Report ===',
+        '=== Voice Usage Report ===',
         '',
-        `Session duration: ${sessionDurationMin.toFixed(1)} min (${sessionDurationHrs.toFixed(2)} hrs)`,
+        `Session duration: ${sessionDurationMin.toFixed(1)} min`,
         '',
-        '--- STT (Azure Speech-to-Text) ---',
-        `Audio processed: ${stt.totalSeconds.toFixed(1)}s (${sttMinutesUsed.toFixed(2)} min)`,
-        `Rate: $${sttCostPerHour.toFixed(2)}/hr of audio`,
-        `Cost today: $${stt.estimatedCostUSD.toFixed(4)}`,
-        `Daily budget: $${stt.dailyBudgetUSD.toFixed(2)}`,
-        `Budget remaining: $${stt.dailyBudgetRemainingUSD.toFixed(4)} (${((stt.dailyBudgetRemainingUSD / stt.dailyBudgetUSD) * 100).toFixed(1)}%)`,
-        `Budget resets: ${stt.dailyBudgetResetAt || 'N/A'}`,
-        stt.budgetExhausted ? '*** BUDGET EXHAUSTED — transcription paused ***' : '',
+        ...usageLines(pipelineStatus),
         '',
-        '--- TTS (Edge TTS) ---',
-        `Total synthesis requests: ${ttsTotalRequests}`,
-        `Cache hits: ${tts.hits} / misses: ${tts.misses} (${ttsCacheHitRate}% hit rate)`,
-        `Cost: FREE (Edge TTS has rate limits but no per-request cost)`,
-        '',
-        '--- Projections ---',
-        `Monthly estimate (8hr/day, 22 days): $${projectedMonthlyUSD.toFixed(2)}`,
-        `Daily estimate at current rate: $${(sessionDurationHrs > 0 ? (stt.estimatedCostUSD / sessionDurationHrs) * 8 : 0).toFixed(4)}`,
+        'Convert to cost with the per-hour (STT) and per-character (TTS) rates of your ElevenLabs plan.',
       ]
 
       return {
@@ -792,39 +772,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      const budgetPct = status.sttUsage.dailyBudgetUSD > 0
-        ? ((status.sttUsage.estimatedCostUSD / status.sttUsage.dailyBudgetUSD) * 100).toFixed(1)
-        : '0.0'
-      const budgetWarnings: string[] = []
-      if (status.sttUsage.budgetExhausted) {
-        budgetWarnings.push('*** STT BUDGET EXHAUSTED — transcription paused until reset ***')
-      } else if (parseFloat(budgetPct) >= 80) {
-        budgetWarnings.push('*** WARNING: Approaching daily STT budget limit ***')
-      }
-
       return {
         content: [{
           type: 'text',
           text: [
             `Connected: ${status.connected}`,
             `Channel: ${channelInfo}`,
-            `STT language: ${sttLanguage}`,
+            `STT language: ${sttLanguage || 'auto'}`,
             `TTS voice: ${ttsVoice}`,
             `Active listeners: ${status.activeUsers.length}`,
             userList ? `Users in channel:\n${userList}` : '',
             '',
-            '--- STT Usage & Budget ---',
-            `Audio sent today: ${status.sttUsage.totalSeconds.toFixed(1)}s (${(status.sttUsage.totalSeconds / 60).toFixed(1)} min)`,
-            `Est. cost today: $${status.sttUsage.estimatedCostUSD.toFixed(4)}`,
-            `Daily budget: $${status.sttUsage.dailyBudgetUSD.toFixed(2)}`,
-            `Budget remaining: $${status.sttUsage.dailyBudgetRemainingUSD.toFixed(4)} (${(100 - parseFloat(budgetPct)).toFixed(1)}%)`,
-            `Budget usage: ${budgetPct}%`,
-            `Budget reset: ${status.sttUsage.dailyBudgetResetAt || 'N/A'}`,
-            ...budgetWarnings,
-            '',
-            '--- TTS Cache ---',
-            `Hits: ${status.ttsCache.hits}`,
-            `Misses: ${status.ttsCache.misses}`,
+            ...usageLines(status),
           ].filter(Boolean).join('\n'),
         }],
       }
@@ -839,20 +798,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: 'No language provided.' }] }
       }
 
-      const oldLanguage = sttLanguage
-      sttLanguage = language
-
-      if (pipeline) {
-        pipeline.setLanguage(language)
-      }
+      const oldLanguage = sttLanguage || 'auto'
+      sttLanguage = language.toLowerCase() === 'auto' ? '' : language
+      pipeline?.setLanguage(sttLanguage || undefined)
 
       return {
         content: [{
           type: 'text',
-          text: `STT language changed: ${oldLanguage} -> ${sttLanguage}\n` +
-            (pipeline?.status.connected
-              ? 'Note: reconnect (voice_leave + voice_join) for STT language change to fully take effect.'
-              : ''),
+          text: `Language changed: ${oldLanguage} -> ${sttLanguage || 'auto'}`,
         }],
       }
     }
@@ -984,11 +937,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         `channel_id: ${pipelineStatus?.channelId ?? '(none)'}`,
         `active_listeners: ${pipelineStatus?.activeUsers.length ?? 0}`,
         `queued_undelivered: ${queued}`,
-        `stt_language: ${sttLanguage}`,
+        `stt_language: ${sttLanguage || 'auto'}`,
         `tts_voice: ${ttsVoice}`,
-        `stt_audio_today: ${pipelineStatus?.sttUsage.totalSeconds.toFixed(1) ?? '0.0'}s`,
-        `stt_cost_today: $${pipelineStatus?.sttUsage.estimatedCostUSD.toFixed(4) ?? '0.0000'}`,
-        `stt_budget_exhausted: ${pipelineStatus?.sttUsage.budgetExhausted ?? false}`,
+        `stt_audio_today: ${pipelineStatus?.sttUsage.used.toFixed(1) ?? '0.0'}s`,
+        `stt_budget_exhausted: ${pipelineStatus?.sttUsage.exhausted ?? false}`,
+        `tts_chars_today: ${pipelineStatus?.ttsUsage.used ?? 0}`,
+        `tts_budget_exhausted: ${pipelineStatus?.ttsUsage.exhausted ?? false}`,
       ]
       return { content: [{ type: 'text', text: lines.join('\n') }] }
     }
