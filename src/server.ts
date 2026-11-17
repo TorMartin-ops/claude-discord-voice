@@ -52,9 +52,9 @@ const VOICE_ENV_FILE = join(VOICE_STATE_DIR, '.env')
 function loadEnvFile(path: string): void {
   try {
     chmodSync(path, 0o600)
-    for (const line of readFileSync(path, 'utf8').split('\n')) {
+    for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
       const m = line.match(/^(\w+)=(.*)$/)
-      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/\r$/, '')
     }
   } catch {
     // File doesn't exist or isn't readable — that's fine.

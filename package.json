@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "npx tsc",
-    "start": "npm install --silent && npm run build && node dist/server.js"
+    "start": "npm install --silent && npm run build && node dist/server.js",
+    "test": "npm run build && node test/run.mjs"
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.2",

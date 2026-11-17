@@ -29,20 +29,37 @@ export interface AllowlistInfo {
 
 let cache: { at: number; info: AllowlistInfo } | null = null;
 
-function parseIds(values: unknown[]): string[] {
+/**
+ * Parse JSON while keeping large integers intact. Snowflakes are 17-20 digits
+ * and exceed Number.MAX_SAFE_INTEGER, so JSON.parse would silently round them.
+ * Bare integers with 16 or more digits are rewritten to strings before parsing;
+ * quoted strings are skipped by the tokenizer so their contents are untouched.
+ */
+export function parseJsonKeepingBigInts(text: string): unknown {
+  const token = /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+  const rewritten = text.replace(token, (m) => (/^\d{16,}$/.test(m) ? `"${m}"` : m));
+  return JSON.parse(rewritten);
+}
+
+/** Keep only well-formed snowflake strings. Other numbers are rejected (they may have lost precision). */
+export function parseIds(values: unknown[], source = "allowlist"): string[] {
   const out: string[] = [];
   for (const v of values) {
-    const s = typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "";
-    if (SNOWFLAKE.test(s)) out.push(s);
+    if (typeof v === "string") {
+      const s = v.trim().replace(/\r$/, "");
+      if (SNOWFLAKE.test(s)) out.push(s);
+    } else if (typeof v === "number") {
+      console.error(`[access] ignoring numeric ID in ${source}: write Discord IDs as strings ("123...") to avoid precision loss`);
+    }
   }
   return out;
 }
 
 function readAccessFile(): string[] {
   try {
-    const data: unknown = JSON.parse(readFileSync(ACCESS_FILE, "utf8"));
+    const data = parseJsonKeepingBigInts(readFileSync(ACCESS_FILE, "utf8"));
     if (data && typeof data === "object" && Array.isArray((data as { allowFrom?: unknown }).allowFrom)) {
-      return parseIds((data as { allowFrom: unknown[] }).allowFrom);
+      return parseIds((data as { allowFrom: unknown[] }).allowFrom, "access.json");
     }
   } catch {
     // missing or unreadable: no entries
@@ -53,7 +70,7 @@ function readAccessFile(): string[] {
 export function loadAllowlist(): AllowlistInfo {
   const now = Date.now();
   if (cache && now - cache.at < CACHE_MS) return cache.info;
-  const env = parseIds((process.env.VOICE_ALLOWED_USERS ?? "").split(/[,\s]+/));
+  const env = parseIds((process.env.VOICE_ALLOWED_USERS ?? "").split(/[,\s]+/), "VOICE_ALLOWED_USERS");
   const file = readAccessFile();
   const info: AllowlistInfo = {
     ids: [...new Set([...env, ...file])],
