@@ -163,35 +163,6 @@ export function createDownsampler(): Transform {
   });
 }
 
-export function createWavBuffer(
-  pcm: Buffer,
-  sampleRate: number,
-  channels: number,
-): Buffer {
-  const byteRate = sampleRate * channels * BYTES_PER_SAMPLE;
-  const blockAlign = channels * BYTES_PER_SAMPLE;
-  const dataSize = pcm.length;
-  const header = Buffer.alloc(44);
-
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write("WAVE", 8);
-
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16); // fmt chunk size
-  header.writeUInt16LE(1, 20); // PCM format
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(BYTES_PER_SAMPLE * 8, 34); // bits per sample
-
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  return Buffer.concat([header, pcm]);
-}
-
 export function calculateRMS(pcm: Buffer): number {
   const sampleCount = Math.floor(pcm.length / BYTES_PER_SAMPLE);
   if (sampleCount === 0) return 0;
@@ -203,13 +174,6 @@ export function calculateRMS(pcm: Buffer): number {
   }
 
   return Math.sqrt(sumSquares / sampleCount);
-}
-
-export function isSilent(
-  pcm: Buffer,
-  threshold: number = 1500,
-): boolean {
-  return calculateRMS(pcm) < threshold;
 }
 
 interface SpeechBufferOptions {

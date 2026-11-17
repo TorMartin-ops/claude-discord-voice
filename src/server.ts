@@ -35,6 +35,7 @@ import { readFileSync, writeFileSync, chmodSync, appendFileSync, mkdirSync, read
 import { homedir } from 'os'
 import { join } from 'path'
 import { VoicePipeline, type VoicePipelineConfig } from './voice-pipeline.js'
+import { debugLog } from './debug.js'
 
 // ---------------------------------------------------------------------------
 // Environment loading
@@ -80,7 +81,7 @@ if (!AZURE_SPEECH_KEY?.trim() || !AZURE_SPEECH_REGION?.trim()) {
     `discord-voice: Azure Speech credentials required (must be non-empty)\n` +
     `  set in ${VOICE_ENV_FILE} or env vars:\n` +
     `  AZURE_SPEECH_KEY=...\n` +
-    `  AZURE_SPEECH_REGION=swedencentral\n`,
+    `  AZURE_SPEECH_REGION=eastus\n`,
   )
   process.exit(1)
 }
@@ -131,12 +132,10 @@ function enqueueVoiceMessage(entry: QueuedMessage): void {
   writeFileSync(tmpPath, JSON.stringify(entry, null, 2) + '\n')
   renameSync(tmpPath, path)
 
-  const line = `[${new Date().toISOString()}] ENQUEUE: user=${entry.user}, text="${entry.content}"\n`
-  try { appendFileSync('/tmp/discord-voice-debug.log', line) } catch {}
-  process.stderr.write(`discord-voice: ENQUEUE: user=${entry.user}, text="${entry.content}"\n`)
+  debugLog(`ENQUEUE: user=${entry.user}, text="${entry.content}"`)
 }
 
-function readUndelivered(limit: number): { path: string; msg: QueuedMessage }[] {
+function readUndelivered(limit = Infinity): { path: string; msg: QueuedMessage }[] {
   let files: string[]
   try {
     files = readdirSync(QUEUE_DIR).filter(f => f.endsWith('.json')).sort()
@@ -148,8 +147,7 @@ function readUndelivered(limit: number): { path: string; msg: QueuedMessage }[] 
     if (results.length >= limit) break
     const path = join(QUEUE_DIR, f)
     try {
-      const raw = readFileSync(path, 'utf8')
-      const msg = JSON.parse(raw) as QueuedMessage
+      const msg = JSON.parse(readFileSync(path, 'utf8')) as QueuedMessage
       if (!msg.delivered) results.push({ path, msg })
     } catch {
       // Corrupt file — skip
@@ -158,24 +156,12 @@ function readUndelivered(limit: number): { path: string; msg: QueuedMessage }[] 
   return results
 }
 
-function countUndelivered(): number {
-  let files: string[]
-  try {
-    files = readdirSync(QUEUE_DIR).filter(f => f.endsWith('.json'))
-  } catch {
-    return 0
-  }
-  let count = 0
-  for (const f of files) {
-    try {
-      const raw = readFileSync(join(QUEUE_DIR, f), 'utf8')
-      const msg = JSON.parse(raw) as QueuedMessage
-      if (!msg.delivered) count++
-    } catch {
-      // Corrupt file — skip
-    }
-  }
-  return count
+function formatChannelTag(msg: QueuedMessage): string {
+  return (
+    `<channel source="discord-voice" chat_id="${msg.channel_id}" user="${msg.user}" user_id="${msg.user_id}" ts="${msg.ts}" language="${msg.language}">\n` +
+    `${msg.content}\n` +
+    `</channel>`
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -251,12 +237,18 @@ const client = new Client({
 // Voice pipeline
 // ---------------------------------------------------------------------------
 
+function parsePositiveInt(value: string | undefined): number | undefined {
+  const n = Number.parseInt(value ?? '', 10)
+  return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
 function makePipelineConfig(): VoicePipelineConfig {
   return {
     azureSttKey: AZURE_SPEECH_KEY!,
     azureSttRegion: AZURE_SPEECH_REGION!,
     sttLanguage,
     ttsVoice,
+    sttTimeoutMs: parsePositiveInt(process.env.VOICE_STT_TIMEOUT_MS),
   }
 }
 
@@ -281,12 +273,6 @@ function ensurePipeline(): VoicePipeline {
     // When transcription arrives, dispatch MCP notification immediately so
     // Claude Code sees it in real-time. File queue remains as fallback.
     pipeline.onTranscription(async (userId, username, text, channelId) => {
-      const debugLine = (msg: string) => {
-        const line = `[${new Date().toISOString()}] ${msg}\n`
-        try { appendFileSync('/tmp/discord-voice-debug.log', line) } catch {}
-        process.stderr.write(`discord-voice: ${msg}\n`)
-      }
-
       const ts = new Date().toISOString()
       enqueueVoiceMessage({
         content: text,
@@ -313,7 +299,7 @@ function ensurePipeline(): VoicePipeline {
           },
         },
       }).catch(err => {
-        debugLine(`NOTIFY_FAILED: ${err instanceof Error ? err.message : err} — message is in queue for poll_queue`)
+        process.stderr.write(`discord-voice: NOTIFY_FAILED: ${err instanceof Error ? err.message : err} — message is in queue for poll_queue\n`)
       })
     })
   }
@@ -347,11 +333,11 @@ const mcp = new Server(
       'The user speaks in the configured STT language (check voice_status for current setting).',
       '',
       'Voice personality & style (IMPORTANT — follow strictly for all voice_reply output):',
-      '  - Channel Jarvis: crisp, confident, dry wit. Never robotic, never rambling.',
+      '  - Tone: crisp, confident, dry wit. Never robotic, never rambling.',
       '  - Be concise but complete — give the full answer, just without the fluff.',
-      '  - Lead with the answer, not the reasoning. Skip filler ("La meg se...", "Selvfølgelig...", "Jeg skal...").',
+      '  - Lead with the answer, not the reasoning. Skip filler ("Let me see...", "Of course...", "I will...").',
       '  - Use natural spoken language — contractions, rhythm. Not written-text-read-aloud.',
-      '  - Dense, not sparse: pack information tight. "Tre feil i auth-modulen, to type-feil og en manglende import" — not five sentences saying the same.',
+      '  - Dense, not sparse: pack information tight. "Three errors in the auth module: two type errors and a missing import" — not five sentences saying the same.',
       '  - For long output (tables, code, lists): give the summary via voice, full details via voice_text_reply.',
       '  - Gentle humor when it fits — a raised eyebrow, not a comedy routine.',
     ].join('\n'),
@@ -569,14 +555,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // voice_reply (TTS)
     // -----------------------------------------------------------------
     case 'voice_reply': {
-      const debugLine = (msg: string) => {
-        const line = `[${new Date().toISOString()}] ${msg}
-`
-        try { appendFileSync('/tmp/discord-voice-debug.log', line) } catch {}
-        process.stderr.write(`discord-voice: ${msg}
-`)
-      }
-
       const text = (args as Record<string, string>).text
       if (!text) {
         return { content: [{ type: 'text', text: 'No text provided.' }] }
@@ -593,7 +571,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Fire-and-forget — don't await, so Claude can process new transcriptions
       pipeline.playResponse(text).catch(err => {
-        debugLine(`TTS background error: ${err instanceof Error ? err.message : err}`)
+        process.stderr.write(`discord-voice: TTS background error: ${err instanceof Error ? err.message : err}\n`)
       })
 
       const preview = text.length > 100 ? text.slice(0, 100) + '...' : text
@@ -601,7 +579,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         ? ` (${text.length} chars, using chunked synthesis)`
         : ''
 
-      debugLine(`voice_reply: fire-and-forget TTS started for ${text.length} chars`)
+      debugLog(`voice_reply: fire-and-forget TTS started for ${text.length} chars`)
 
       return {
         content: [{
@@ -778,7 +756,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       return {
         content: [{
           type: 'text',
-          text: lines.filter(l => l !== undefined).join('\n'),
+          text: lines.join('\n'),
         }],
       }
     }
@@ -965,11 +943,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       const lines: string[] = []
       for (const { path, msg } of entries) {
-        lines.push(
-          `<channel source="discord-voice" chat_id="${msg.channel_id}" user="${msg.user}" user_id="${msg.user_id}" ts="${msg.ts}" language="${msg.language}">\n` +
-          `${msg.content}\n` +
-          `</channel>`,
-        )
+        lines.push(formatChannelTag(msg))
         // Mark as delivered by removing the file
         try { rmSync(path, { force: true }) } catch {}
       }
@@ -990,10 +964,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       return {
         content: [{
           type: 'text',
-          text:
-            `<channel source="discord-voice" chat_id="${msg.channel_id}" user="${msg.user}" user_id="${msg.user_id}" ts="${msg.ts}" language="${msg.language}">\n` +
-            `${msg.content}\n` +
-            `</channel>`,
+          text: formatChannelTag(msg),
         }],
       }
     }
@@ -1002,7 +973,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // voice_debug_status
     // -----------------------------------------------------------------
     case 'voice_debug_status': {
-      const queued = countUndelivered()
+      const queued = readUndelivered().length
       const pipelineStatus = pipeline?.status
       const lines = [
         `bot_connected: ${client.isReady()}`,

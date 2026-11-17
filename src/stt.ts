@@ -11,7 +11,6 @@
  */
 
 import * as sdk from "microsoft-cognitiveservices-speech-sdk";
-import { Readable } from "stream";
 
 export interface STTConfig {
   subscriptionKey: string;
@@ -28,6 +27,7 @@ export interface TranscriptionResult {
   durationMs: number;
   confidence: number;
   budgetExhausted?: boolean; // true when this result signals budget cap reached
+  quotaExceeded?: boolean; // true when Azure rejected the request because the subscription quota is used up
 }
 
 export interface UsageStats {
@@ -161,8 +161,6 @@ export class SpeechToText {
       };
     }
 
-    const durationMs = (pcmBuffer.length / BYTES_PER_SECOND) * 1000;
-
     // Clamp to max duration
     const effectiveBytes = Math.min(
       pcmBuffer.length,
@@ -211,22 +209,17 @@ export class SpeechToText {
       console.error(
         `[stt] transcription failed: ${err instanceof Error ? err.message : err}`,
       );
+      if (this.isQuotaError(err)) {
+        return {
+          text: "",
+          language: this.language,
+          durationMs: 0,
+          confidence: 0,
+          quotaExceeded: true,
+        };
+      }
       return null;
     }
-  }
-
-  /**
-   * Transcribe from a streaming PCM source (16kHz mono 16-bit LE).
-   * Currently buffers the full stream then delegates to transcribe().
-   * The interface enables future true streaming STT without changing callers.
-   */
-  async transcribeStream(pcmStream: Readable): Promise<TranscriptionResult | null> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of pcmStream) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    if (chunks.length === 0) return null;
-    return this.transcribe(Buffer.concat(chunks));
   }
 
   get usage(): UsageStats {
@@ -327,6 +320,11 @@ export class SpeechToText {
       msg.includes("socket hang up") ||
       msg.includes("network")
     );
+  }
+
+  /** Azure reports an exhausted subscription quota (e.g. the F0 monthly cap) in the error text. */
+  private isQuotaError(err: unknown): boolean {
+    return err instanceof Error && /quota/i.test(err.message);
   }
 
   private sleep(ms: number): Promise<void> {
