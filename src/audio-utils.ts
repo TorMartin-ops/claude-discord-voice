@@ -6,8 +6,11 @@ import { createRequire } from "module";
 
 const DEFAULT_SILENCE_DURATION_MS = 300; // reduced from 450 — faster utterance emission
 const DEFAULT_MIN_SPEECH_DURATION_MS = 200; // catch short "ja"/"nei" (~200ms)
-const DEFAULT_MAX_SPEECH_DURATION_MS = 15000; // 15s prevents runaway noise accumulation; Azure handles shorter segments better
-const DEFAULT_PRE_SPEECH_BUFFER_MS = 500;
+const DEFAULT_MAX_SPEECH_DURATION_MS = 30000; // prevents runaway noise accumulation
+const DEFAULT_PRE_ROLL_MS = 300;
+const DEFAULT_CONFIRM_MS = 160; // ~5 VAD frames of continuous speech before an utterance starts
+const MIN_SPEECH_RATIO = 0.2; // below this share of speech frames an utterance is treated as noise
+const RMS_FALLBACK_THRESHOLD = 700;
 const DIGITAL_SILENCE_RMS = 20; // Lowered from 50 — avoid filtering quiet speakers
 
 const DISCORD_SAMPLE_RATE = 48000;
@@ -20,6 +23,7 @@ const BYTES_PER_SAMPLE = 2; // 16-bit audio
 // At 16kHz mono 16-bit: 512 samples = 1024 bytes.
 const VAD_FRAME_SAMPLES = 512;
 const VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * BYTES_PER_SAMPLE; // 1024
+const VAD_FRAME_MS = (VAD_FRAME_SAMPLES / STT_SAMPLE_RATE) * 1000; // 32
 
 // Speech probability threshold — Silero v5 default is 0.5
 const DEFAULT_SPEECH_THRESHOLD = 0.5;
@@ -39,7 +43,7 @@ const OPUS_MAX_PACKET_SIZE = 5760; // max Opus frame size in bytes
  * which is immune to SIGSEGV — decode errors throw normal JS exceptions.
  *
  * Performance: opusscript is ~2-5x slower than native, but Opus decoding
- * is not the bottleneck (Azure STT and Edge TTS are). At typical voice
+ * is not the bottleneck (the network round trips are). At typical voice
  * rates (50 packets/sec), the CPU cost is negligible.
  */
 class SafeOpusDecoder extends Transform {
@@ -111,7 +115,7 @@ export function createOpusDecoder(): Transform {
  * The ratio is exactly 3 (48000/16000), so each output sample is the average
  * of 3 consecutive input samples (box filter). This acts as a simple low-pass
  * filter that attenuates frequencies above ~8kHz before decimation, preventing
- * aliasing artifacts that would corrupt the speech band sent to Azure STT.
+ * aliasing artifacts that would corrupt the speech band sent to STT.
  *
  * Previous implementation used point-sampling (no filter), which folded
  * 8-24kHz energy (sibilants, noise, keyboard clicks) into 0-8kHz as distortion.
@@ -180,20 +184,23 @@ interface SpeechBufferOptions {
   silenceDuration?: number;
   minSpeechDuration?: number;
   maxSpeechDuration?: number;
-  preSpeechBuffer?: number;
+  /** Audio kept from before speech was confirmed, so the first word is never clipped. */
+  preRoll?: number;
+  /** Continuous speech required before an utterance starts. Filters coughs and clicks. */
+  confirmDuration?: number;
   /** Silero VAD speech probability threshold (0-1). Default: 0.5. */
   speechThreshold?: number;
 }
 
-interface SpeechBufferStats {
-  totalAudioMs: number;
-  speechMs: number;
-  silenceMs: number;
-  utterances: number;
-}
+/** Events a SpeechBuffer emits while a user talks. All audio is 16 kHz mono 16-bit PCM. */
+export type SpeechEvent =
+  | { type: "start"; audio: Buffer } // speech confirmed; audio includes the pre-roll
+  | { type: "audio"; audio: Buffer }
+  | { type: "end"; discard: boolean }; // discard: too short or mostly noise
 
 const enum State {
   WAITING,
+  CONFIRMING,
   SPEAKING,
 }
 
@@ -251,255 +258,201 @@ function pcmInt16ToFloat32(pcm: Buffer): Float32Array {
 }
 
 /**
- * Speech buffer using Silero VAD v5 (DNN-based) for speech detection.
+ * Streaming speech segmenter on top of Silero VAD v5.
  *
- * Replaces Google's WebRTC VAD (GMM-based) for dramatically better accuracy.
- * Silero v5 is trained on 6000+ languages and distinguishes speech from noise
- * far better than WebRTC VAD, especially in noisy environments.
- *
- * Keeps: pre-speech buffer, adaptive silence duration,
- * min/max speech duration, digital silence filter, noise ratio filtering.
- *
- * Async: ONNX inference is async, so feed() returns Promise<Buffer | null>.
- * Use SpeechBuffer.create() instead of new SpeechBuffer().
+ * Emits `start` once speech has lasted `confirmDuration` (with `preRoll` of
+ * earlier audio attached), then every VAD frame as `audio`, and finally `end`
+ * after adaptive trailing silence. Use SpeechBuffer.create(); loading the
+ * ONNX model is async.
  */
 export class SpeechBuffer {
   private readonly silenceDurationMs: number;
   private readonly minSpeechDurationMs: number;
   private readonly maxSpeechDurationMs: number;
-  private readonly preSpeechBufferMs: number;
+  private readonly preRollLimitMs: number;
+  private readonly confirmFrames: number;
   private readonly speechThreshold: number;
-
-  // Silero VAD v5 model
   private readonly vad: SileroModel;
 
-  // Frame accumulator — Silero v5 needs exactly 1024 bytes (512 samples = 32ms at 16kHz)
+  // Silero v5 needs exactly 512 samples (32ms at 16kHz) per call.
   private frameAccumulator: Buffer = Buffer.alloc(0);
 
   private state: State = State.WAITING;
-  private speechChunks: Buffer[] = [];
-  private speechStartMs: number = 0;
-  private lastSpeechMs: number = 0;
-  private preSpeechRing: Buffer[] = [];
-  private preSpeechRingMs: number = 0;
+  private preRoll: Buffer[] = [];
+  private preRollBufferedMs = 0;
+  private candidate: Buffer[] = [];
+  private totalAudioMs = 0;
+  private speechStartMs = 0;
+  private lastSpeechMs = 0;
+  private speechFrames = 0;
+  private totalFrames = 0;
+  private feedCount = 0;
 
-  private totalAudioMs: number = 0;
-  private speechMs: number = 0;
-  private silenceMs: number = 0;
-  private utteranceCount: number = 0;
-
-  // Per-utterance speech frame tracking for noise ratio filtering
-  private utteranceSpeechFrames: number = 0;
-  private utteranceTotalFrames: number = 0;
-
-  private constructor(vad: SileroModel, options: SpeechBufferOptions = {}) {
+  private constructor(vad: SileroModel, options: SpeechBufferOptions) {
     this.silenceDurationMs = options.silenceDuration ?? DEFAULT_SILENCE_DURATION_MS;
     this.minSpeechDurationMs = options.minSpeechDuration ?? DEFAULT_MIN_SPEECH_DURATION_MS;
     this.maxSpeechDurationMs = options.maxSpeechDuration ?? DEFAULT_MAX_SPEECH_DURATION_MS;
-    this.preSpeechBufferMs = options.preSpeechBuffer ?? DEFAULT_PRE_SPEECH_BUFFER_MS;
+    this.preRollLimitMs = options.preRoll ?? DEFAULT_PRE_ROLL_MS;
+    this.confirmFrames = Math.ceil((options.confirmDuration ?? DEFAULT_CONFIRM_MS) / VAD_FRAME_MS);
     this.speechThreshold = options.speechThreshold ?? DEFAULT_SPEECH_THRESHOLD;
     this.vad = vad;
   }
 
-  /**
-   * Async factory — loads Silero v5 ONNX model (cached after first call).
-   */
   static async create(options: SpeechBufferOptions = {}): Promise<SpeechBuffer> {
-    const model = await loadSileroV5();
-    return new SpeechBuffer(model, options);
+    return new SpeechBuffer(await loadSileroV5(), options);
   }
 
-  private feedCount = 0;
+  /** True while an utterance is in progress (confirmed speech, not yet ended). */
+  get speaking(): boolean {
+    return this.state === State.SPEAKING;
+  }
 
-  async feed(chunk: Buffer): Promise<Buffer | null> {
-    if (chunk.length === 0) return null;
-    const chunkMs = this.pcmToMs(chunk.length);
-    this.totalAudioMs += chunkMs;
+  /** How long to wait for more audio before treating silence as the end of the utterance. */
+  get endSilenceMs(): number {
+    const spokenMs = this.totalAudioMs - this.speechStartMs;
+    if (spokenMs < 1000) return this.silenceDurationMs; // short answers: "yes", "no"
+    if (spokenMs < 3000) return Math.max(this.silenceDurationMs, 400);
+    return Math.max(this.silenceDurationMs, 500); // long sentences: allow thinking pauses
+  }
 
-    // Skip digital silence — codec artifacts, not real audio
-    const rms = calculateRMS(chunk);
-
+  async feed(chunk: Buffer): Promise<SpeechEvent[]> {
+    if (chunk.length === 0) return [];
+    this.totalAudioMs += this.pcmToMs(chunk.length);
     this.feedCount++;
 
-    if (rms < DIGITAL_SILENCE_RMS) {
-      this.silenceMs += chunkMs;
-      return null;
-    }
+    // Digital silence while idle is codec padding; skip the VAD to save CPU.
+    if (this.state === State.WAITING && calculateRMS(chunk) < DIGITAL_SILENCE_RMS) return [];
 
-    // Accumulate to exact VAD frame boundaries (1024 bytes = 512 samples = 32ms at 16kHz)
-    // Always copy to avoid Buffer pool aliasing issues
-    this.frameAccumulator = this.frameAccumulator.length > 0
-      ? Buffer.concat([this.frameAccumulator, chunk])
-      : Buffer.from(chunk);
+    this.frameAccumulator = Buffer.concat([this.frameAccumulator, chunk]);
+    // Guard against unbounded growth if the stream is corrupt.
+    if (this.frameAccumulator.length > VAD_FRAME_BYTES * 10) this.frameAccumulator = Buffer.alloc(0);
 
-    // Guard against unbounded accumulator growth (corrupted stream, stalled pipeline)
-    if (this.frameAccumulator.length > VAD_FRAME_BYTES * 10) {
-      this.frameAccumulator = Buffer.alloc(0);
-    }
-
-    // Process all complete VAD frames
-    // Returns the FIRST emitted utterance; subsequent ones are queued internally.
-    let result: Buffer | null = null;
+    const events: SpeechEvent[] = [];
     while (this.frameAccumulator.length >= VAD_FRAME_BYTES) {
       const frame = Buffer.from(this.frameAccumulator.subarray(0, VAD_FRAME_BYTES));
-      this.frameAccumulator = Buffer.from(this.frameAccumulator.subarray(VAD_FRAME_BYTES));
-
-      const frameResult = await this.processVadFrame(frame);
-      if (frameResult && !result) {
-        result = frameResult; // return first emitted utterance (multi-utterance is rare)
-      }
+      this.frameAccumulator = this.frameAccumulator.subarray(VAD_FRAME_BYTES);
+      events.push(...(await this.processFrame(frame)));
     }
-
-    return result;
+    return events;
   }
 
-  private async processVadFrame(frame: Buffer): Promise<Buffer | null> {
-    const frameMs = this.pcmToMs(frame.length);
-
-    // Silero VAD v5: returns probability of speech (0.0-1.0)
-    let isSpeech: boolean;
-    try {
-      const float32Frame = pcmInt16ToFloat32(frame);
-      const probs = await this.vad.process(float32Frame);
-      isSpeech = probs.isSpeech >= this.speechThreshold;
-    } catch (err) {
-      // VAD error — fall back to RMS threshold
-      const rms = calculateRMS(frame);
-      isSpeech = rms >= 700;
-      if (this.feedCount <= 5 || this.feedCount % 500 === 0) {
-        console.error(`[speech-buffer] Silero VAD error (falling back to RMS=${rms.toFixed(0)}): ${err instanceof Error ? err.message : err}`);
-      }
-    }
-
-    if (isSpeech) {
-      this.speechMs += frameMs;
-    } else {
-      this.silenceMs += frameMs;
-    }
-
-    if (this.state === State.WAITING) {
-      if (!isSpeech) {
-        this.pushToPreSpeechRing(frame);
-        return null;
-      }
-
-      this.state = State.SPEAKING;
-      this.speechStartMs = this.totalAudioMs - frameMs;
-      this.lastSpeechMs = this.totalAudioMs;
-      this.utteranceSpeechFrames = 1; // this frame is speech
-      this.utteranceTotalFrames = 1;
-
-      this.speechChunks = [...this.preSpeechRing, frame];
-      this.preSpeechRing = [];
-      this.preSpeechRingMs = 0;
-      return null;
-    }
-
-    // State.SPEAKING
-    this.speechChunks.push(frame);
-    this.utteranceTotalFrames++;
-
-    if (isSpeech) {
-      this.lastSpeechMs = this.totalAudioMs;
-      this.utteranceSpeechFrames++;
-    }
-
-    const elapsed = this.totalAudioMs - this.speechStartMs;
-
-    if (elapsed >= this.maxSpeechDurationMs) {
-      return this.emitUtterance();
-    }
-
-    const silenceElapsed = this.totalAudioMs - this.lastSpeechMs;
-    if (!isSpeech && silenceElapsed >= this.getEffectiveSilenceDuration()) {
-      return this.emitUtterance();
-    }
-
-    return null;
-  }
-
-  flush(): Buffer | null {
-    if (this.state === State.SPEAKING && this.speechChunks.length > 0) {
-      return this.emitUtterance();
-    }
-    return null;
-  }
-
-  get stats(): SpeechBufferStats {
-    return {
-      totalAudioMs: this.totalAudioMs,
-      speechMs: this.speechMs,
-      silenceMs: this.silenceMs,
-      utterances: this.utteranceCount,
-    };
-  }
-
-  /**
-   * Adaptive silence duration based on how long the person has been speaking.
-   * Short utterances ("ja", "nei") use the default threshold.
-   * Longer speech gets more tolerance for mid-sentence thinking pauses.
-   */
-  private getEffectiveSilenceDuration(): number {
-    const speechDuration = this.totalAudioMs - this.speechStartMs;
-    if (speechDuration < 1000) {
-      // Short utterance ("ja", "nei"): use base (300ms)
-      return this.silenceDurationMs;
-    } else if (speechDuration < 3000) {
-      // Medium: brief pauses (400ms)
-      return Math.max(this.silenceDurationMs, 400);
-    } else {
-      // Long sentence: thinking pauses (500ms)
-      return Math.max(this.silenceDurationMs, 500);
-    }
-  }
-
-  private emitUtterance(): Buffer | null {
-    const pcm = Buffer.concat(this.speechChunks);
-    this.speechChunks = [];
+  /** The audio source went quiet. Ends the current utterance, if any. */
+  endOfInput(): SpeechEvent[] {
+    const events: SpeechEvent[] = this.state === State.SPEAKING ? [this.endUtterance()] : [];
     this.state = State.WAITING;
-    this.preSpeechRing = [];
-    this.preSpeechRingMs = 0;
-
-    // Capture and reset per-utterance frame counters
-    const speechFrames = this.utteranceSpeechFrames;
-    const totalFrames = this.utteranceTotalFrames;
-    this.utteranceSpeechFrames = 0;
-    this.utteranceTotalFrames = 0;
-
-    const durationMs = this.pcmToMs(pcm.length);
-    if (durationMs < this.minSpeechDurationMs) {
-      return null;
-    }
-
-    // Skip utterances that are mostly noise — if VAD classified < 20% of frames
-    // as speech, the buffer is dominated by ambient noise and Azure will either
-    // return NoMatch or hallucinate garbled text.
-    const speechRatio = totalFrames > 0 ? speechFrames / totalFrames : 0;
-    if (speechRatio < 0.20) {
-      console.error(
-        `[speech-buffer] skipping noise utterance: speechRatio=${(speechRatio * 100).toFixed(0)}% ` +
-        `(${speechFrames}/${totalFrames} frames, ${durationMs.toFixed(0)}ms)`,
-      );
-      return null;
-    }
-
-    this.utteranceCount++;
-    return pcm;
+    this.candidate = [];
+    return events;
   }
 
-  private pushToPreSpeechRing(chunk: Buffer): void {
-    const chunkMs = this.pcmToMs(chunk.length);
-    this.preSpeechRing.push(chunk);
-    this.preSpeechRingMs += chunkMs;
+  private async processFrame(frame: Buffer): Promise<SpeechEvent[]> {
+    const isSpeech = await this.classify(frame);
 
-    while (this.preSpeechRingMs > this.preSpeechBufferMs && this.preSpeechRing.length > 1) {
-      const removed = this.preSpeechRing.shift()!;
-      this.preSpeechRingMs -= this.pcmToMs(removed.length);
+    switch (this.state) {
+      case State.WAITING:
+        if (!isSpeech) {
+          this.pushPreRoll(frame);
+          return [];
+        }
+        this.state = State.CONFIRMING;
+        this.candidate = [frame];
+        return this.candidate.length >= this.confirmFrames ? this.startUtterance() : [];
+
+      case State.CONFIRMING:
+        if (!isSpeech) {
+          for (const kept of [...this.candidate, frame]) this.pushPreRoll(kept);
+          this.candidate = [];
+          this.state = State.WAITING;
+          return [];
+        }
+        this.candidate.push(frame);
+        return this.candidate.length >= this.confirmFrames ? this.startUtterance() : [];
+
+      case State.SPEAKING: {
+        this.totalFrames++;
+        if (isSpeech) {
+          this.speechFrames++;
+          this.lastSpeechMs = this.totalAudioMs;
+        }
+        const events: SpeechEvent[] = [{ type: "audio", audio: frame }];
+        const tooLong = this.totalAudioMs - this.speechStartMs >= this.maxSpeechDurationMs;
+        const silentLongEnough = !isSpeech && this.totalAudioMs - this.lastSpeechMs >= this.endSilenceMs;
+        if (tooLong || silentLongEnough) events.push(this.endUtterance());
+        return events;
+      }
+    }
+  }
+
+  private startUtterance(): SpeechEvent[] {
+    const audio = Buffer.concat([...this.preRoll, ...this.candidate]);
+    this.speechStartMs = this.totalAudioMs - this.pcmToMs(Buffer.concat(this.candidate).length);
+    this.lastSpeechMs = this.totalAudioMs;
+    this.speechFrames = this.candidate.length;
+    this.totalFrames = this.candidate.length;
+    this.preRoll = [];
+    this.preRollBufferedMs = 0;
+    this.candidate = [];
+    this.state = State.SPEAKING;
+    return [{ type: "start", audio }];
+  }
+
+  private endUtterance(): SpeechEvent {
+    const durationMs = this.totalAudioMs - this.speechStartMs;
+    const speechRatio = this.totalFrames > 0 ? this.speechFrames / this.totalFrames : 0;
+    this.state = State.WAITING;
+    // Short blips and mostly-noise segments would only produce hallucinated text.
+    return { type: "end", discard: durationMs < this.minSpeechDurationMs || speechRatio < MIN_SPEECH_RATIO };
+  }
+
+  private async classify(frame: Buffer): Promise<boolean> {
+    try {
+      const probs = await this.vad.process(pcmInt16ToFloat32(frame));
+      return probs.isSpeech >= this.speechThreshold;
+    } catch (err) {
+      // Degrade to an energy threshold rather than dropping the user's speech.
+      if (this.feedCount <= 5 || this.feedCount % 500 === 0) {
+        console.error(`[speech-buffer] Silero VAD error, using RMS fallback: ${err instanceof Error ? err.message : err}`);
+      }
+      return calculateRMS(frame) >= RMS_FALLBACK_THRESHOLD;
+    }
+  }
+
+  private pushPreRoll(frame: Buffer): void {
+    this.preRoll.push(frame);
+    this.preRollBufferedMs += this.pcmToMs(frame.length);
+    while (this.preRollBufferedMs > this.preRollLimitMs && this.preRoll.length > 1) {
+      this.preRollBufferedMs -= this.pcmToMs(this.preRoll.shift()!.length);
     }
   }
 
   private pcmToMs(byteLength: number): number {
-    const samples = byteLength / BYTES_PER_SAMPLE;
-    return (samples / STT_SAMPLE_RATE) * 1000;
+    return (byteLength / BYTES_PER_SAMPLE / STT_SAMPLE_RATE) * 1000;
+  }
+}
+
+/**
+ * Upsample 24 kHz mono 16-bit PCM to 48 kHz stereo (Discord's raw format)
+ * with linear interpolation. Stateful across chunks, tolerates odd chunk sizes.
+ */
+export class PcmUpsampler {
+  private carry: Buffer = Buffer.alloc(0);
+  private previous = 0;
+
+  process(input: Buffer): Buffer {
+    const data = this.carry.length > 0 ? Buffer.concat([this.carry, input]) : input;
+    const samples = data.length >> 1;
+    this.carry = Buffer.from(data.subarray(samples * 2));
+
+    const output = Buffer.allocUnsafe(samples * 8); // 2 stereo frames per input sample
+    let offset = 0;
+    for (let i = 0; i < samples; i++) {
+      const sample = data.readInt16LE(i * 2);
+      const midpoint = (this.previous + sample) >> 1;
+      offset = output.writeInt16LE(midpoint, offset);
+      offset = output.writeInt16LE(midpoint, offset);
+      offset = output.writeInt16LE(sample, offset);
+      offset = output.writeInt16LE(sample, offset);
+      this.previous = sample;
+    }
+    return output;
   }
 }
