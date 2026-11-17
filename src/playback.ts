@@ -6,6 +6,7 @@
  * fades the current audio out over a few milliseconds instead of cutting it.
  */
 
+import { safeError } from "./redact.js";
 import { AudioPlayerStatus, createAudioResource, StreamType, type AudioPlayer, type AudioResource } from "@discordjs/voice";
 import { debugLog } from "./debug.js";
 import { isTtsAbort, type SpeechStream, type TextToSpeech } from "./tts.js";
@@ -43,7 +44,7 @@ export class Playback {
   ) {
     player.on(AudioPlayerStatus.Idle, () => this.advance());
     player.on("error", (err) => {
-      console.error(`[playback] audio player error: ${err.message}`);
+      console.error(`[playback] audio player error: ${safeError(err)}`);
       this.advance();
     });
   }
@@ -95,7 +96,7 @@ export class Playback {
     this.prefetch();
 
     speech.done.catch((err) => {
-      if (!isTtsAbort(err)) console.error(`[playback] speech synthesis failed: ${err instanceof Error ? err.message : err}`);
+      if (!isTtsAbort(err)) console.error(`[playback] speech synthesis failed: ${safeError(err)}`);
     });
 
     const resource = createAudioResource(speech, { inputType: StreamType.Raw, inlineVolume: true });

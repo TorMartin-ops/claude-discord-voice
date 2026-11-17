@@ -81,7 +81,8 @@ VOICE_DEFAULT_LANGUAGE=nb-NO             # optional, unset = detect automaticall
 VOICE_BACKCHANNEL=mm                     # optional filler if Claude is slow, off by default
 VOICE_BACKCHANNEL_DELAY_MS=1500          # optional
 VOICE_STT_TIMEOUT_MS=10000               # optional, max wait for a transcript after end of speech
-VOICE_DEBUG=1                            # optional, verbose logging incl. per-turn latency
+VOICE_ALLOWED_USERS=1234567890123456789  # comma-separated Discord user IDs allowed to speak to Claude
+VOICE_DEBUG=1                            # optional, timings only; 2 also logs transcript text
 ```
 
 See `.env.example` for a template.
@@ -128,6 +129,17 @@ With `VOICE_DEBUG=1` every turn logs end of speech to transcript, and end of spe
 | `src/elevenlabs.ts` | Shared websocket connection and error types |
 | `src/usage-budget.ts` | Daily usage cap |
 | `src/audio-utils.ts` | Opus decoding, resampling, streaming speech segmenter (Silero v5 VAD, pre-roll, confirmation window) |
+
+## Security
+
+This plugin lets people in a Discord voice channel talk to a Claude Code session that can act on your machine, so it only listens to people you name.
+
+- **Speaker allowlist, deny by default.** Only Discord user IDs in `VOICE_ALLOWED_USERS` (in `~/.claude/channels/discord-voice/.env`) or in the `allowFrom` list of the Discord text plugin's `~/.claude/channels/discord/access.json` are listened to. Audio from anyone else is never subscribed to, transcribed or sent to ElevenLabs. With no allowlist configured, all voice input is ignored and `voice_status` and the startup log say how to fix it.
+- **Injection hardening.** Display names and transcripts are escaped before they are wrapped in `<channel>` tags, and the stable user ID is the identity.
+- **Secrets.** Keys live in `~/.claude/channels/...` with `600` permissions, the ElevenLabs key is sent as a header only, and known secrets are redacted from logs and tool output. Transcripts are not logged unless `VOICE_DEBUG=2`.
+- **Input validation.** Tool arguments (IDs, voice, language, text length) are validated.
+
+See [SECURITY.md](SECURITY.md) for the trust model and how to report a vulnerability.
 
 ## Contributing
 

@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { safeError } from "./redact.js";
 
 const API_HOST = "api.elevenlabs.io";
 const CONNECT_TIMEOUT_MS = 8_000;
@@ -44,7 +45,7 @@ export function connectSocket(
       socket.removeAllListeners("unexpected-response");
       resolve(socket);
     });
-    socket.once("error", (err) => reject(new ElevenLabsError(err.message)));
+    socket.once("error", (err) => reject(new ElevenLabsError(safeError(err))));
     socket.once("unexpected-response", (_req, res) => {
       socket.terminate();
       const status = res.statusCode ?? 0;

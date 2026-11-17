@@ -9,6 +9,7 @@
  * Docs: https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime
  */
 
+import { safeError } from "./redact.js";
 import WebSocket from "ws";
 import { connectSocket, ElevenLabsError, toIsoLanguage } from "./elevenlabs.js";
 import { DailyBudget, type BudgetSnapshot } from "./usage-budget.js";
@@ -140,7 +141,7 @@ export class SttSession {
       this.fail(err);
       return;
     }
-    console.error(`[stt] connection lost, retrying: ${err.message}`);
+    console.error(`[stt] connection lost, retrying: ${safeError(err)}`);
     setTimeout(() => !this.closed && this.connect(), RECONNECT_DELAY_MS);
   }
 
